@@ -317,10 +317,27 @@ Capture whichever path came back as `<repo_dir>` (the MCP tool's own `repo_dir`,
 ## Phase 5 — Remediation & Static Validation
 
 Read every file in `AFFECTED_FILES` fully (never patch blind), apply the minimal fix per
-`SUGGESTED_FIX_APPROACH`. Then invoke the **testing** sub-skill for static verification (one
-bounded retry on failure). If it still fails: stop, post a Jira comment, send the Phase 10 Slack
-alert with `EXECUTION_STATUS=REMEDIATION_FAILED`, write the Databricks incident row, jump to
-Phase 11.
+`SUGGESTED_FIX_APPROACH`.
+
+**On Claude Code**, do this with the Read/Edit tools directly against `<repo_dir>` — no MCP call
+needed, this client has real filesystem access.
+
+**On Claude Desktop, this is the one phase with no built-in fallback** — Desktop has no Bash tool
+and no file-editing tool of its own; everything it can do comes from an MCP server. Read/write the
+file through this plugin's own `opsbuddy-git-ops`:
+```
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__read_file(repo_dir="<repo_dir>", path="<AFFECTED_FILE>")
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__write_file(repo_dir="<repo_dir>", path="<AFFECTED_FILE>", content="<full new file content>")
+```
+`write_file` replaces the whole file — read it first, edit the content in-memory, then write the
+complete result back; there is no line-level patch tool. Confirm the change actually landed with
+`git_status` (or a follow-up `read_file`) before moving to Phase 6. (This closed a real gap: an
+earlier Desktop run diagnosed the fix correctly and got as far as creating the hotfix branch, then
+had no way to actually write the one-line change and had to halt and hand off to a human.)
+
+Then invoke the **testing** sub-skill for static verification (one bounded retry on failure). If it
+still fails: stop, post a Jira comment, send the Phase 10 Slack alert with
+`EXECUTION_STATUS=REMEDIATION_FAILED`, write the Databricks incident row, jump to Phase 11.
 
 ## Phase 6 — Commit & Push
 

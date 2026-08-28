@@ -20,6 +20,17 @@ Tools:
     get_repo_mapping(source_path, job_id="", source_content="")
     create_pr(repo, branch, base, title, body)
     find_open_pr(repo, search_text)
+    read_file(repo_dir, path)
+    write_file(repo_dir, path, content)
+
+read_file/write_file close the one phase that had no Desktop-side fallback at all: opsbuddy-fix's
+Phase 5 (remediation) needs to actually edit a file in the cloned working tree, and unlike every
+other phase, Desktop has no Bash tool and no file-editing tool of its own to fall back to -- every
+one of its capabilities comes from an MCP server. Confirmed in practice: a real Desktop-driven run
+diagnosed the fix correctly, created the hotfix branch, and then had nothing to write the change
+with -- it had to halt and hand off to a human for a one-line edit. These two tools are Claude
+Code's Read/Edit, exposed over MCP, scoped the same way every other tool here is (must resolve
+under the repo's own working tree, whole-file only, no shell involved).
 
 get_repo_mapping needs DATABRICKS_HOST/DATABRICKS_TOKEN (only that one tool -- everything else
 above works with zero Databricks config at all). It re-implements the same Databricks Repos /
@@ -144,6 +155,23 @@ def _resolve_under_workdir(raw_path: str, *, must_exist: bool = False) -> Path:
     if must_exist and not resolved.exists():
         raise ValueError(f"{resolved} does not exist")
     return resolved
+
+
+def _resolve_repo_relative(repo_dir: str, rel_path: str) -> Path:
+    """Resolve `rel_path` against an already-cloned `repo_dir` and refuse anything that would
+    land outside that repo's own working tree (a `../` escape) or inside `.git/` (repo internals,
+    never a source file a fix should touch). Reuses `_resolve_under_workdir` first so `repo_dir`
+    itself still has to be a real, already-existing checkout under the server's sandboxed
+    workdir -- this adds a second, narrower boundary on top of that: the repo root itself."""
+    repo = _resolve_under_workdir(repo_dir, must_exist=True)
+    candidate = (repo / rel_path).resolve()
+    try:
+        relative = candidate.relative_to(repo)
+    except ValueError:
+        raise ValueError(f"{rel_path!r} resolves outside repo_dir {repo} -- refusing")
+    if relative.parts and relative.parts[0] == ".git":
+        raise ValueError(f"{rel_path!r} is inside .git/ -- refusing to touch repo internals")
+    return candidate
 
 
 def _kill_process_tree(pid: int) -> None:
@@ -738,6 +766,51 @@ def find_open_pr(repo: str, search_text: str) -> dict:
         return {**empty, "error": None}
     except Exception as exc:  # noqa: BLE001 - see create_pr
         return {**empty, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# 11. read_file / 12. write_file
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def read_file(repo_dir: str, path: str) -> dict:
+    """Read a text file at `path` (relative to an already-cloned `repo_dir`). For Phase 5 on
+    Claude Desktop, which has no file-reading tool of its own -- read the file here, edit its
+    content, then pass the whole new content to write_file. Whole-file only; there is no
+    line-range/patch mode. Text files only -- a binary file will fail to decode as UTF-8."""
+    try:
+        target = _resolve_repo_relative(repo_dir, path)
+    except ValueError as exc:
+        return {"content": None, "error": str(exc)}
+    if not target.exists():
+        return {"content": None, "error": f"{target} does not exist"}
+    if not target.is_file():
+        return {"content": None, "error": f"{target} is not a file"}
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        return {"content": None, "error": f"not a UTF-8 text file: {exc}"}
+    return {"content": content, "error": None}
+
+
+@mcp.tool()
+def write_file(repo_dir: str, path: str, content: str) -> dict:
+    """Write `content` as the complete new contents of the file at `path` (relative to an
+    already-cloned `repo_dir`), overwriting it if it exists or creating it (and any missing
+    parent directories) if not. Whole-file only -- always read_file first and edit its content in
+    full, rather than guessing at a partial patch. This is a plain file write, not a git
+    operation -- git_status/git_commit still need to be called afterward to stage and commit it."""
+    try:
+        target = _resolve_repo_relative(repo_dir, path)
+    except ValueError as exc:
+        return {"written": False, "error": str(exc)}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return {"written": False, "error": str(exc)}
+    return {"written": True, "path": str(target), "error": None}
 
 
 def _run_http() -> None:
