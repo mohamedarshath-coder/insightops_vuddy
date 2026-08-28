@@ -106,6 +106,7 @@ CONFIDENCE: <high|medium|low>
 | Both `false` | Proceed to halt — agreement on "not fixable" is just as actionable as agreement on "fixable" |
 | **Disagree** on `CODE_FIX_POSSIBLE` | **Fail closed**: treat as `false`. Surface both verdicts verbatim so a human sees exactly where they diverged. Never average, guess, or pick one arbitrarily. |
 | Either reports `CONFIDENCE: low` | Surface that explicitly regardless of agreement |
+| **One agent errors out entirely** (a tool denial, crash, or timeout — no verdict returned at all, not a low-confidence one) | This is **not** the same as agreement or disagreement — don't silently treat it as either. Confirmed in practice: a permission-classifier denial killed one of two parallel Bash-using agents mid-run while the other completed normally. First, **retry only the failed agent once** (the surviving one already has a real answer — no need to redo it). If the retry also errors: you now have exactly one real verdict, not two independent ones — that's a genuinely weaker guarantee than the plugin's own adversarial-double-check design promises, so **say so explicitly** in the report rather than presenting it as a normal reconciled result. Proceed on that single verdict only if it reports `CODE_FIX_POSSIBLE: true` **and** `CONFIDENCE: high` — anything less (low/medium confidence, or `false`) fails closed the same as the low-confidence/disagreement cases above. |
 
 ---
 
