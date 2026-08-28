@@ -112,15 +112,65 @@ def _resolve_under_workdir(raw_path: str, *, must_exist: bool = False) -> Path:
     return resolved
 
 
-def _run_git(args: List[str], cwd: Path, env: Optional[dict] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args],
+def _kill_process_tree(pid: int) -> None:
+    """Best-effort kill of a process AND its children. A plain .kill()/.terminate() only
+    signals the immediate process -- git and lint/test tools can spawn helper subprocesses
+    that survive that, leaving a "timed out" tool call quietly orphaned in the background
+    forever. `taskkill /T` (Windows) / process-group SIGKILL (POSIX) kills the whole tree."""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10
+            )
+        else:
+            import signal
+
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except Exception:  # noqa: BLE001 - best-effort cleanup, never let this raise
+        pass
+
+
+def _run(args: List[str], cwd: Path, env: Optional[dict] = None, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+    """subprocess.run-alike used for every git/lint/test invocation in this server.
+
+    Two things a plain `subprocess.run(..., timeout=...)` does NOT reliably give you, both
+    confirmed the hard way in practice (a git_clone call left an orphaned `git.exe` running
+    40+ minutes after the tool call itself had already timed out, with no error ever reaching
+    the MCP client):
+      1. stdin is explicitly closed (`DEVNULL`). Left unset, a child inherits this server's
+         own stdin -- which is the live MCP stdio transport, not a real terminal or /dev/null.
+         If the child ever attempts to read from stdin for any reason, that read blocks
+         forever, since nothing meant for it will ever arrive on that pipe.
+      2. On timeout, the WHOLE process tree is killed (see _kill_process_tree), and a clean
+         timed-out CompletedProcess is returned -- instead of letting TimeoutExpired escape
+         uncaught, which leaves the real OS process running as an orphan with nothing to
+         report the failure back to the caller.
+    """
+    proc = subprocess.Popen(
+        args,
         cwd=str(cwd),
-        capture_output=True,
-        text=True,
         env=env,
-        timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout or SUBPROCESS_TIMEOUT_SECONDS)
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc.pid)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001 - already killed; just reclaim the pipes if possible
+            pass
+        return subprocess.CompletedProcess(
+            args, -1, "", f"timed out after {timeout or SUBPROCESS_TIMEOUT_SECONDS}s and was killed"
+        )
+
+
+def _run_git(args: List[str], cwd: Path, env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    return _run(["git", *args], cwd=cwd, env=env)
 
 
 def _with_token_auth(repo_url: str) -> str:
@@ -330,10 +380,7 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         [sys.executable, "-m", "py_compile", *py_files],
     ):
         try:
-            proc = subprocess.run(
-                tool_args, cwd=str(cwd), capture_output=True, text=True,
-                timeout=SUBPROCESS_TIMEOUT_SECONDS,
-            )
+            proc = _run(tool_args, cwd=cwd)
         except FileNotFoundError as exc:
             results.append({"tool": tool_args[0], "passed": False, "returncode": None,
                              "stdout": "", "stderr": f"not installed/found: {exc}"})
@@ -345,10 +392,9 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         candidate = cwd / "python" / "tests" / f"test_{stem}.py"
         if candidate.exists():
             try:
-                proc = subprocess.run(
+                proc = _run(
                     ["pytest", str(candidate.relative_to(cwd)), "-m", "not integration", "-v"],
-                    cwd=str(cwd), capture_output=True, text=True,
-                    timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                    cwd=cwd,
                 )
                 results.append(_tool_result(f"pytest:{candidate.name}", proc))
             except FileNotFoundError as exc:
@@ -380,10 +426,7 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
         return {"passed": False, "stdout": "", "stderr": str(exc), "returncode": None}
 
     try:
-        proc = subprocess.run(
-            ["pytest", test_path, "-m", markers, "-v"],
-            cwd=str(cwd), capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SECONDS,
-        )
+        proc = _run(["pytest", test_path, "-m", markers, "-v"], cwd=cwd)
     except FileNotFoundError as exc:
         return {"passed": False, "stdout": "", "stderr": str(exc), "returncode": None}
     return {
