@@ -241,24 +241,37 @@ Capture the ticket key — used in every later branch name, commit, comment.
 ## Phase 4 — Git Setup
 
 Resolve the real backing repo from the failed task's `source_path` — never assume a fixed
-default repo:
+default repo. Prefer this plugin's own `get_repo_mapping` (bundled in `opsbuddy-git-ops`) — it
+tries Databricks' two official git-linkage mechanisms *and* the heuristic source-scan fallback
+in one call, and is guaranteed available whenever this plugin itself is installed:
 ```
-# MCP-preferred (databricks-lineage)
+# MCP-preferred (this plugin's own opsbuddy-git-ops -- official Databricks linkage first, then
+# falls back to scanning source_content for a hardcoded git URL, all in one call)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_repo_mapping(
+  source_path="<failed task's source_path>", job_id="<job_id>",
+  source_content="<the task source already fetched for Phase 2 -- gives the heuristic fallback something to scan>")
+
+# MCP alternative (databricks-job-lineage, if installed -- some deployed versions of that server
+# don't expose this tool at all; official mechanisms only, no heuristic fallback)
 mcp__plugin_databricks-job-lineage_databricks-lineage__get_repo_mapping(source_path="<failed task's source_path>", job_id="<job_id>")
 
-# Bash fallback
+# Bash fallback (official mechanisms only -- see the manual heuristic steps below if this errors)
 python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py get-repo-mapping \
   --source-path "<failed task's source_path>" --job-id <job_id>
 ```
-Always pass `job_id`. `repo_url`/`error: null` → use that `repo_url`/`branch` for every step
-below.
+Always pass `job_id` and, for the preferred path, `source_content`. `repo_url`/`error: null` →
+use that `repo_url`/`branch` for every step below. The response's `resolution_method`
+(`databricks_repos` / `job_git_source` / `heuristic_source_scan`) tells you which mechanism
+actually resolved it — if it's the heuristic one, note that explicitly in the ticket/report: it's
+a strong signal, not a guarantee.
 
-**`error` set, or the tool isn't available at all — don't stop yet, try one more thing first.**
-`get_repo_mapping` only knows about Databricks' two *official* git-linkage mechanisms (a Repos
-checkout under `/Repos/...`, or a job-level Git source configured in the Jobs UI). Plenty of real
-jobs use **neither** — the task's own code just runs a plain `git clone <url>` itself, which is
-completely invisible to Databricks' APIs (confirmed in practice, twice: both test jobs used to
-validate this pipeline had exactly this shape). Before giving up:
+**If you're on the Bash fallback (no built-in heuristic) and it also errors — don't stop yet,
+try the same heuristic manually first.** `get_repo_mapping` only knows about Databricks' two
+*official* git-linkage mechanisms (a Repos checkout under `/Repos/...`, or a job-level Git source
+configured in the Jobs UI). Plenty of real jobs use **neither** — the task's own code just runs a
+plain `git clone <url>` itself, which is completely invisible to Databricks' APIs (confirmed in
+practice, twice: both test jobs used to validate this pipeline had exactly this shape). Before
+giving up:
 
 1. You should already have the failing task's source fetched (Phase 2's diagnosis step needs it
    anyway) — if not, fetch it now via `get_source_file`/the Bash equivalent.

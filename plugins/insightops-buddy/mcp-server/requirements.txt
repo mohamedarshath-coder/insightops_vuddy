@@ -10,3 +10,6 @@ black
 isort
 flake8
 pytest
+
+# Only needed for get_repo_mapping -- every other tool works with zero Databricks config.
+databricks-sdk>=0.30.0

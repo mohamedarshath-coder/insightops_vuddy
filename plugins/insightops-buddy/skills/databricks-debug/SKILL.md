@@ -31,19 +31,28 @@ Capture the full stack trace, error message, cluster ID, and task parameters —
 its `source_path`) — do this here, not later, since Step 3's agents have no MCP/Databricks access
 of their own (`tools: Read, Grep, Glob, Bash` only) and can't fetch it themselves.
 
-**Then resolve the repo it lives in** via `get_repo_mapping` (MCP) / `get-repo-mapping` (Bash). If
-that fails or the tool isn't available: `get_repo_mapping` only knows Databricks' two *official*
-git-linkage mechanisms (a Repos checkout, or a job-level Git source) — plenty of real jobs use
-neither, instead running a plain `git clone <url>` inside their own task code, invisible to
-Databricks' APIs (confirmed in practice, twice, building this skill). Before giving up: scan the
-source you just fetched for a hardcoded git URL (a `git clone` call, or a bare `https://.../....git`
-string, often assigned to a variable like `REPO_URL`) and use the first match. Strip any embedded
-credential from that URL before using it further (e.g. `https://TOKEN@github.com/...` → drop the
-`TOKEN@` — clone/read access shouldn't need it if the repo's public, and this skill has no write
-step of its own anyway), and flag that embedded credential in your Step 4 report as a live,
-exposed secret regardless of whether it's related to the actual failure. Note explicitly in the
-report whenever the repo was resolved via this heuristic rather than Databricks' own tracked
-git-linkage — it's a strong signal, not a guarantee.
+**Then resolve the repo it lives in.** Prefer this plugin's own `get_repo_mapping` (bundled in
+`opsbuddy-git-ops`), passing the source you just fetched so its heuristic fallback has something
+to scan:
+```
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_repo_mapping(
+  source_path="<source_path>", job_id="<job_id>", source_content="<the source you just fetched>")
+```
+Check `resolution_method` in the response (`databricks_repos` / `job_git_source` /
+`heuristic_source_scan`) — if it's the heuristic one, note that explicitly in your Step 4 report:
+it's a strong signal, not a guarantee. If that tool isn't available, fall back to
+`databricks-job-lineage`'s own `get_repo_mapping` (MCP) or `get-repo-mapping` (Bash) — neither has
+a built-in heuristic, so if it errors, do the same scan yourself: `get_repo_mapping` only knows
+Databricks' two *official* git-linkage mechanisms (a Repos checkout, or a job-level Git source) —
+plenty of real jobs use neither, instead running a plain `git clone <url>` inside their own task
+code, invisible to Databricks' APIs (confirmed in practice, twice, building this skill). Scan the
+source you already fetched for a hardcoded git URL (a `git clone` call, or a bare
+`https://.../....git` string, often assigned to a variable like `REPO_URL`) and use the first
+match. Strip any embedded credential from that URL before using it further (e.g.
+`https://TOKEN@github.com/...` → drop the `TOKEN@` — clone/read access shouldn't need it if the
+repo's public, and this skill has no write step of its own anyway), and flag that embedded
+credential in your Step 4 report as a live, exposed secret regardless of whether it's related to
+the actual failure.
 
 ---
 

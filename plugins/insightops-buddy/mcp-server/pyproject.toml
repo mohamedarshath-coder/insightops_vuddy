@@ -12,4 +12,5 @@ dependencies = [
     "isort",
     "flake8",
     "pytest",
+    "databricks-sdk>=0.30.0",
 ]

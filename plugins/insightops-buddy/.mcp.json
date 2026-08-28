@@ -10,7 +10,9 @@
       ],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
-        "OPSBUDDY_MCP_WORKDIR": "${OPSBUDDY_MCP_WORKDIR}"
+        "OPSBUDDY_MCP_WORKDIR": "${OPSBUDDY_MCP_WORKDIR}",
+        "DATABRICKS_HOST": "${DATABRICKS_HOST}",
+        "DATABRICKS_TOKEN": "${DATABRICKS_TOKEN}"
       }
     }
   }

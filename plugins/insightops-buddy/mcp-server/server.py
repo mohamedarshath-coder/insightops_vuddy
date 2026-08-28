@@ -17,6 +17,15 @@ Tools:
     git_push(repo_dir, branch, remote="origin")
     run_static_checks(repo_dir, files)
     run_pytest(repo_dir, test_path, markers="not integration")
+    get_repo_mapping(source_path, job_id="", source_content="")
+
+get_repo_mapping needs DATABRICKS_HOST/DATABRICKS_TOKEN (only that one tool -- everything else
+above works with zero Databricks config at all). It re-implements the same Databricks Repos /
+job-level Git source lookup the databricks-job-lineage plugin's own get_repo_mapping does, so this
+plugin doesn't depend on that other plugin being installed or exposing that tool, PLUS a third
+fallback neither of those has: scanning already-fetched task source for a hardcoded git URL, for
+jobs whose task code clones a repo manually in Python rather than using either of Databricks'
+official git-linkage mechanisms (confirmed in practice, twice, building this plugin).
 
 Every path argument (target_dir, repo_dir) must resolve underneath OPSBUDDY_MCP_WORKDIR (default:
 a workdir/ folder next to this file) -- this server refuses to touch anything outside it, so a
@@ -39,6 +48,7 @@ README.md for the exact client config.
 """
 
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -53,6 +63,11 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+
+# Only get_repo_mapping needs these -- lazily validated inside that tool, not at startup, so
+# every other tool in this server keeps working with zero Databricks config at all.
+DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "").strip()
+DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "").strip()
 
 # Every clone/repo-dir argument must resolve under this directory -- the one guardrail that
 # keeps a bad or malicious path from writing/deleting outside a known sandbox. Defaults to a
@@ -213,6 +228,45 @@ def _tool_result(tool: str, proc: subprocess.CompletedProcess) -> dict:
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
+
+
+def _databricks_client():
+    """Lazy Databricks client -- only constructed when get_repo_mapping is actually called, so a
+    missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither."""
+    if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
+        raise RuntimeError(
+            "DATABRICKS_HOST and DATABRICKS_TOKEN must both be set for get_repo_mapping "
+            "(no other tool in this server needs them)."
+        )
+    from databricks.sdk import WorkspaceClient
+
+    return WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
+
+
+# Matches a git-clonable URL, optionally with an embedded credential (https://TOKEN@host/... or
+# a bare user@host: SSH form), ending in a repo path. Deliberately conservative -- would rather
+# miss an unusual URL shape than mis-extract something that isn't really a repo URL.
+_GIT_URL_PATTERN = re.compile(
+    r"(?:https?://(?:[^@\s\"'/]+@)?[^\s\"']+?\.git|git@[^\s\"':]+:[^\s\"']+?\.git)"
+)
+
+
+def _find_git_url_in_source(source_content: str) -> Optional[str]:
+    """Heuristic fallback (Mechanism 3) for jobs whose task code clones a repo manually in
+    Python/shell rather than using either of Databricks' official git-linkage mechanisms --
+    confirmed in practice, twice, that this is a real, common pattern, not a hypothetical one.
+    Returns the FIRST match with any embedded credential stripped, or None if nothing matches.
+    Multiple distinct git operations in one file would only ever return the first -- a caller
+    that cares should inspect source_content itself rather than assume this is exhaustive."""
+    match = _GIT_URL_PATTERN.search(source_content)
+    if not match:
+        return None
+    url = match.group(0)
+    if url.startswith("git@"):
+        return url  # SSH form has no embeddable token to strip
+    # Strip an embedded https://TOKEN@host/... credential -- the caller authenticates via
+    # GITHUB_TOKEN/GIT_ASKPASS instead, never via a token baked into the URL itself.
+    return re.sub(r"://[^@\s\"'/]+@", "://", url)
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +488,147 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
         "returncode": proc.returncode,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 8. get_repo_mapping
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "") -> dict:
+    """
+    Resolve a Databricks task's source_path to the git repo it actually lives in, trying three
+    mechanisms in order:
+
+      1. Databricks Repos -- source_path is a workspace path under /Repos/...; the path itself
+         identifies the Repo (and therefore the git remote/branch) it was checked out from.
+      2. Job-level Git source -- the task's "Source" is set to a Git provider directly (Jobs UI:
+         Job details -> Git). Here source_path is *relative to the repo root* (no leading "/"),
+         and the repo URL/branch live on the job's settings.git_source instead -- pass job_id for
+         this case to resolve at all.
+      3. Heuristic source scan -- if 1 and 2 both find nothing, and you pass the task's actual
+         source (source_content, e.g. from a fetch via another server's get_source_file), scans
+         it for a hardcoded git URL. This covers jobs whose task code clones a repo manually in
+         Python/shell rather than using either official mechanism -- confirmed in practice, twice,
+         building this plugin, that this is common, not a hypothetical. Any embedded credential
+         in that URL is stripped before it's returned.
+
+    A source_path resolved by none of the three returns repo_url=None -- treat that as "there is
+    no git repo to fix this in", not something to retry.
+    """
+    empty = {
+        "source_path": source_path,
+        "repo_url": None,
+        "repo_path_in_workspace": None,
+        "relative_path_in_repo": None,
+        "branch": None,
+        "provider": None,
+        "resolution_method": None,
+    }
+
+    if not source_path:
+        return {**empty, "error": "empty source_path"}
+
+    from databricks.sdk.errors import DatabricksError
+
+    # --- Mechanism 1: Databricks Repos (workspace path under /Repos/...) ---
+    if source_path.startswith("/Repos/"):
+        try:
+            client = _databricks_client()
+        except RuntimeError as exc:
+            return {**empty, "error": str(exc)}
+        try:
+            best_match = None
+            for repo in client.repos.list():
+                repo_path = getattr(repo, "path", None)
+                if repo_path and source_path.startswith(repo_path.rstrip("/") + "/"):
+                    if best_match is None or len(repo_path) > len(best_match.path):
+                        best_match = repo
+        except DatabricksError as exc:
+            return {**empty, "error": f"could not list Databricks Repos: {exc}"}
+
+        if best_match:
+            repo_path = best_match.path.rstrip("/")
+            return {
+                "source_path": source_path,
+                "repo_url": getattr(best_match, "url", None),
+                "repo_path_in_workspace": repo_path,
+                "relative_path_in_repo": source_path[len(repo_path):].lstrip("/"),
+                "branch": getattr(best_match, "branch", None),
+                "provider": (str(getattr(best_match, "provider", "")) or None),
+                "resolution_method": "databricks_repos",
+                "error": None,
+            }
+        # Falls through to Mechanism 3 below rather than erroring immediately -- a /Repos/ path
+        # Databricks doesn't recognize is unusual but not proof there's no heuristic answer.
+
+    # --- Mechanism 2: job-level Git source ---
+    elif not source_path.startswith("/"):
+        if not job_id:
+            return {
+                **empty,
+                "error": (
+                    "source_path looks like a repo-relative path (no leading '/', not under "
+                    "/Repos/), which means this task's Source is set to a Git provider rather "
+                    "than a workspace path. Pass job_id so the job's git_source can be resolved, "
+                    "or pass source_content for the heuristic fallback instead."
+                ),
+            }
+        try:
+            client = _databricks_client()
+        except RuntimeError as exc:
+            return {**empty, "error": str(exc)}
+        try:
+            job = client.jobs.get(job_id=int(job_id))
+        except DatabricksError as exc:
+            return {**empty, "error": f"could not fetch job {job_id}: {exc}"}
+
+        git_source = getattr(job.settings, "git_source", None) if job.settings else None
+        if git_source and getattr(git_source, "git_url", None):
+            return {
+                "source_path": source_path,
+                "repo_url": git_source.git_url,
+                "repo_path_in_workspace": None,
+                "relative_path_in_repo": source_path,
+                "branch": (
+                    getattr(git_source, "git_branch", None)
+                    or getattr(git_source, "git_tag", None)
+                    or getattr(git_source, "git_commit", None)
+                ),
+                "provider": str(getattr(git_source, "git_provider", "")) or None,
+                "resolution_method": "job_git_source",
+                "error": None,
+            }
+        # No git_source configured -- falls through to Mechanism 3 below.
+
+    # --- Mechanism 3: heuristic scan of already-fetched task source ---
+    if source_content:
+        found_url = _find_git_url_in_source(source_content)
+        if found_url:
+            return {
+                "source_path": source_path,
+                "repo_url": found_url,
+                "repo_path_in_workspace": None,
+                "relative_path_in_repo": None,
+                "branch": None,
+                "provider": None,
+                "resolution_method": "heuristic_source_scan",
+                "error": (
+                    "Resolved via a heuristic scan of the task's own source for a hardcoded git "
+                    "URL, NOT via Databricks' tracked git-linkage -- treat as a strong signal, "
+                    "not a guarantee. Note this explicitly in any report."
+                ),
+            }
+
+    return {
+        **empty,
+        "error": (
+            "No git repo found for this source_path via Databricks Repos, job-level Git source, "
+            "or (if source_content was passed) a hardcoded URL in the task's own code. This task "
+            "may not be linked to any git repo at all."
+        ),
     }
 
 

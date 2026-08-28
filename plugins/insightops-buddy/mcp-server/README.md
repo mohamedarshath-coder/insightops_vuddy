@@ -80,6 +80,7 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `git_push` | `git push -u <remote> <branch>` | Authenticated via `GIT_ASKPASS` if `GITHUB_TOKEN` is set — the token never touches `.git/config` or the URL. |
 | `run_static_checks` | `black --check`, `isort --check`, `flake8 --max-line-length=120`, `python -m py_compile`, then `pytest` on any matching `python/tests/test_<module>.py` | Mirrors the `testing` skill's Step 2 exactly; non-`.py` files in the list are reported as skipped, not silently dropped. |
 | `run_pytest` | `pytest <test_path> -m <markers> -v` | For ad-hoc/retry test runs outside the fixed `test_<module>.py` convention. |
+| `get_repo_mapping` | Databricks Repos list / job `git_source` lookup via `databricks-sdk`, or a regex scan of a passed-in `source_content` string | The only tool needing `DATABRICKS_HOST`/`DATABRICKS_TOKEN` — everything else works with neither set. Re-implements the same lookup `databricks-job-lineage`'s own `get_repo_mapping` does (so this plugin doesn't depend on that one being installed), plus a third fallback neither has: scanning already-fetched task source for a hardcoded git URL, for jobs whose task code clones a repo manually rather than using either official Databricks git-linkage mechanism. |
 
 ## Safety model
 
