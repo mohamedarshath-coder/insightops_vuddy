@@ -13,20 +13,21 @@ client is driving it.
 
 ## 1. Install
 
-**Required even when this plugin is installed via the marketplace** — `.mcp.json` declares how to
-*launch* this server (`${CLAUDE_PLUGIN_ROOT}/mcp-server/.venv/Scripts/python.exe`), but installing
-the plugin does not create that venv or install its dependencies for you. Do this once, in the
-installed plugin's own directory (find it with `/plugin` in Claude Code, or see this repo's
-`plugins/insightops-buddy/mcp-server/` if you're developing locally):
+**Nothing to do** — `.mcp.json` launches this server via `uv run --directory
+${CLAUDE_PLUGIN_ROOT}/mcp-server server.py`. `uv` (not a bare venv) reads `pyproject.toml` and
+provisions a fresh environment itself on first launch — including `black`/`isort`/`flake8`/
+`pytest`, which `run_static_checks`/`run_pytest` shell out to by name. This matters specifically
+because plugin installs get **re-synced from git periodically** (e.g. on toggle off/on) — a
+manually-created `.venv` doesn't survive that (found this the hard way: it got wiped on a plugin
+reload), whereas `uv run` just re-provisions from `pyproject.toml` again, every time, with no
+manual step at all. The only prerequisite is `uv` itself being installed
+(https://docs.astral.sh/uv/getting-started/installation/) and on `PATH`.
 
+For local development outside the plugin (not required for normal plugin use):
 ```bash
 cd plugins/insightops-buddy/mcp-server
-python -m venv .venv && .venv\Scripts\activate   # or: source .venv/bin/activate
-pip install -r requirements.txt
+uv run server.py
 ```
-
-`black`/`isort`/`flake8`/`pytest` must be importable/runnable in this same environment —
-`run_static_checks`/`run_pytest` shell out to them by name, they aren't Python imports.
 
 ## 2. Configure environment variables
 
@@ -46,12 +47,13 @@ instead `copy .env.example .env` and fill it in there.
 ## 3. Run it standalone to sanity-check it starts
 
 ```bash
-python server.py
+uv run server.py
 ```
 
-You should see `opsbuddy-git-ops workdir: ...` on stderr and the process will sit waiting on
-stdio — that's normal, it's not meant to print anything else until a client talks to it. Ctrl-C
-to stop. If `git` isn't on PATH you'll get a `FATAL:` message instead of a silent hang.
+First run provisions the environment (installs ~46 packages, takes a few seconds); subsequent
+runs are fast. You should see `opsbuddy-git-ops workdir: ...` on stderr and the process will sit
+waiting on stdio — that's normal, it's not meant to print anything else until a client talks to
+it. Ctrl-C to stop. If `git` isn't on PATH you'll get a `FATAL:` message instead of a silent hang.
 
 ## 4. Installed via the marketplace? Registration is automatic
 
@@ -96,7 +98,7 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 ## Running as a remote connector
 
 Same pattern as the `databricks-lineage` server — set `MCP_TRANSPORT=http`, `MCP_HOST`,
-`MCP_PORT`, and `MCP_API_KEY`, then run `python server.py`. Given this server can write to a real
+`MCP_PORT`, and `MCP_API_KEY`, then run `uv run server.py`. Given this server can write to a real
 working tree and push to a real remote, think harder before exposing it this way than you would
 for a read-only server — put a reverse proxy/TLS in front, and treat `MCP_API_KEY` as sensitive
 as `GITHUB_TOKEN` itself, since anyone holding it can push commits as this process.

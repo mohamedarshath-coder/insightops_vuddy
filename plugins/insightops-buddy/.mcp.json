@@ -1,9 +1,12 @@
 {
   "mcpServers": {
     "opsbuddy-git-ops": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/mcp-server/.venv/Scripts/python.exe",
+      "command": "uv",
       "args": [
-        "${CLAUDE_PLUGIN_ROOT}/mcp-server/server.py"
+        "run",
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}/mcp-server",
+        "server.py"
       ],
       "env": {
         "GITHUB_TOKEN": "${GITHUB_TOKEN}",
