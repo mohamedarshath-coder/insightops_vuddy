@@ -398,6 +398,42 @@ regardless of client:
 ```bash
 python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py log-incident --json-file <path-to-record.json>
 ```
+**The JSON record's keys must match the real table's actual columns exactly** — this table
+predates this plugin (built for an earlier email-alert version of this design, before the pivot
+to Slack), so its column names don't match this skill's own vocabulary one-for-one. Verified
+against the real table (`dev.ops_incidents.incident_log`, or whatever `DATABRICKS_OPS_INCIDENT_TABLE`
+points at) via `DESCRIBE TABLE`; write exactly this shape:
+```json
+{
+  "incident_id": "<TICKET-KEY>",
+  "jira_ticket_id": "<TICKET-KEY>",
+  "databricks_job_id": <job_id, as a number, not a string>,
+  "databricks_run_id": <run_id, as a number, not a string>,
+  "job_name": "<job_name>",
+  "task_key": "<failing task_key>",
+  "error_category": "<ERROR_CATEGORY>",
+  "root_cause_summary": "<ROOT_CAUSE_SUMMARY>",
+  "stack_trace_excerpt": "<short excerpt, not the full trace>",
+  "code_fix_possible": <true|false>,
+  "target_repo": "<owner/repo resolved in Phase 4>",
+  "branch_name": "<hotfix branch>",
+  "commit_sha": "<sha from Phase 6, or empty string if not reached>",
+  "pr_url": "<pr_url, or empty string if not reached>",
+  "pr_review_verdict": "<Mode A verdict, or empty string if not reached>",
+  "execution_status": "<EXECUTION_STATUS>",
+  "severity": "High",
+  "detected_at": "<ISO timestamp of Phase 1's telemetry fetch -- this column has no default, the insert fails outright without it>",
+  "resolved_at": "<ISO timestamp of this Phase 10 write, or omit if not yet resolved>",
+  "email_sent": <true|false -- this table has no Slack-specific column; reuse this one to mean "an alert was sent" regardless of channel, until/unless the table is renamed>,
+  "email_recipients": "<the Slack channel or webhook target actually used, or empty string>"
+}
+```
+Confirmed working end-to-end with this exact shape (insert, then read back, then delete a
+test row) — an earlier attempt using this skill's own natural field names (`job_id`, `repo`,
+`slack_sent`, etc.) failed with `UNRESOLVED_COLUMN`/`DELTA_INSERT_COLUMN_MISMATCH` against the
+real table. If a future table redesign renames `email_sent`/`email_recipients` to something
+Slack-native, update this block to match — don't silently drift back to guessed field names.
+
 If `SLACK_WEBHOOK_URL`/a Slack MCP server, or the Databricks incident-log table isn't configured,
 note that plainly in the final report rather than treating it as a silent no-op or a hard failure.
 
