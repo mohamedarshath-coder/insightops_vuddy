@@ -1,0 +1,11 @@
+[project]
+name = "opsbuddy-git-ops-mcp-server"
+version = "0.1.0"
+description = "Local MCP server exposing git working-tree ops and static validation for opsbuddy-fix on Claude Desktop"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0,<2.0.0",
+    "starlette>=0.37.0",
+    "uvicorn>=0.30.0",
+]

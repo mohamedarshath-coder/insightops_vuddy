@@ -1,0 +1,12 @@
+mcp>=1.2.0,<2.0.0
+# Only needed for MCP_TRANSPORT=http (running as a remote connector, not local stdio)
+uvicorn>=0.30.0
+starlette>=0.37.0
+
+# Not imported by server.py -- these are invoked as external CLI tools by run_static_checks/
+# run_pytest (subprocess), so they must be installed and on PATH in whatever environment this
+# server runs in, same as the "testing" skill assumes on the Claude Code side.
+black
+isort
+flake8
+pytest

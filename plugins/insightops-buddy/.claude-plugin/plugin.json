@@ -1,0 +1,8 @@
+{
+  "name": "insightops-buddy",
+  "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose, ticket, fix, PR, review, verify, and alert across 11 phases.",
+  "version": "1.0.0",
+  "author": {
+    "name": "mohamedarshath-coder"
+  }
+}
