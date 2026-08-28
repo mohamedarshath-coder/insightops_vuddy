@@ -251,7 +251,32 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py get-repo-mapping \
   --source-path "<failed task's source_path>" --job-id <job_id>
 ```
 Always pass `job_id`. `repo_url`/`error: null` → use that `repo_url`/`branch` for every step
-below. `error` set → **stop**, report the error plainly rather than guessing at a repo.
+below.
+
+**`error` set, or the tool isn't available at all — don't stop yet, try one more thing first.**
+`get_repo_mapping` only knows about Databricks' two *official* git-linkage mechanisms (a Repos
+checkout under `/Repos/...`, or a job-level Git source configured in the Jobs UI). Plenty of real
+jobs use **neither** — the task's own code just runs a plain `git clone <url>` itself, which is
+completely invisible to Databricks' APIs (confirmed in practice, twice: both test jobs used to
+validate this pipeline had exactly this shape). Before giving up:
+
+1. You should already have the failing task's source fetched (Phase 2's diagnosis step needs it
+   anyway) — if not, fetch it now via `get_source_file`/the Bash equivalent.
+2. Scan that source text for a hardcoded git URL: look for a `git clone` invocation, or a bare
+   `https://...` / `git@...` string ending in `.git` (commonly assigned to a variable like
+   `REPO_URL`). Take the first match.
+3. **Strip any embedded credential before using this further** — a URL like
+   `https://ghp_xxx@github.com/owner/repo.git` has a token baked into it; use just
+   `https://github.com/owner/repo.git` for cloning (the plugin's own git tools authenticate via
+   `GITHUB_TOKEN`/`GIT_ASKPASS`, never via a token embedded in the URL), and treat that embedded
+   token as a **live, exposed credential** worth flagging in the ticket regardless of whether it's
+   related to this incident's actual fix.
+4. Note in the ticket/report that the repo was resolved via this heuristic, not via Databricks'
+   own tracked git-linkage — it's a strong signal, not a guarantee (a source file that clones more
+   than one repo, or clones something incidental rather than its own project, would fool this).
+
+Only if this heuristic also finds nothing → **stop**, report the error plainly rather than
+guessing at a repo.
 
 **Dedup — check for an existing open PR for this run before creating anything**, e.g. via
 PyGithub's `get_pulls(state="open")` filtered by title/branch referencing this run/job ID.
