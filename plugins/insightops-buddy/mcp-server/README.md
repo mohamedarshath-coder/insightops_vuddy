@@ -1,15 +1,16 @@
 # opsbuddy-git-ops MCP Server
 
-A small local MCP server that gives Claude Desktop the one thing it's missing to run the
-`opsbuddy-fix` pipeline: a shell. Jira already has an MCP path (the Atlassian connector), and
-GitHub/Slack/Databricks already have MCP servers configured — none of those can clone a repo,
-run `git commit`/`push` against a local working tree, or shell out to `black`/`isort`/`flake8`/
-`pytest`. This server exposes exactly that, scoped to git plumbing and static validation — it is
-**not** a general-purpose remote-shell server.
+A small local MCP server that gives Claude Desktop the things it's missing to run the
+`opsbuddy-fix` pipeline end-to-end on its own: a shell for git/lint/test operations, and a
+verified GitHub API path for PR creation — bundled with this plugin specifically so the whole
+pipeline is self-sufficient, rather than depending on a separately-configured `github` MCP server
+whose exact tool contract was never verified against this skill's needs. Scoped to git plumbing,
+static validation, and PR creation only — it is **not** a general-purpose remote-shell server, and
+it never merges or closes a PR (this pipeline's whole design never merges its own PR).
 
-It mirrors `workflow/git_workflow.py`'s `GitRepoManager` (the Claude Code side of this plugin)
-and the `testing` skill's static-validation step, so behavior stays the same regardless of which
-client is driving it.
+It mirrors `workflow/git_workflow.py`'s `GitRepoManager`/`GitHubClient` (the Claude Code side of
+this plugin) and the `testing` skill's static-validation step, so behavior stays the same
+regardless of which client is driving it.
 
 ## 1. Install
 
@@ -81,6 +82,15 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `run_static_checks` | `black --check`, `isort --check`, `flake8 --max-line-length=120`, `python -m py_compile`, then `pytest` on any matching `python/tests/test_<module>.py` | Mirrors the `testing` skill's Step 2 exactly; non-`.py` files in the list are reported as skipped, not silently dropped. |
 | `run_pytest` | `pytest <test_path> -m <markers> -v` | For ad-hoc/retry test runs outside the fixed `test_<module>.py` convention. |
 | `get_repo_mapping` | Databricks Repos list / job `git_source` lookup via `databricks-sdk`, or a regex scan of a passed-in `source_content` string | The only tool needing `DATABRICKS_HOST`/`DATABRICKS_TOKEN` — everything else works with neither set. Re-implements the same lookup `databricks-job-lineage`'s own `get_repo_mapping` does (so this plugin doesn't depend on that one being installed), plus a third fallback neither has: scanning already-fetched task source for a hardcoded git URL, for jobs whose task code clones a repo manually rather than using either official Databricks git-linkage mechanism. |
+| `create_pr` | GitHub API `create_pull` via PyGithub | Requires `GITHUB_TOKEN` (unlike every `git_*` tool above, which can work without one for public repos/SSH remotes — the GitHub API always needs a token). Never merges or closes anything. |
+| `find_open_pr` | GitHub API `get_pulls(state="open")` via PyGithub, filtered by title/branch substring | For Phase 4's PR-dedup check — reuse an existing PR for this incident instead of opening a duplicate. |
+
+Behind a TLS-intercepting corporate proxy (e.g. Zscaler), `create_pr`/`find_open_pr` need one more
+thing: `OPSBUDDY_EXTRA_CA_CERT` (or it reuses `NODE_EXTRA_CA_CERTS` automatically if that's already
+set for another MCP server) pointing at your proxy's root CA cert. Without it, both tools fail
+outright with `SSLCertVerificationError` — confirmed in practice, not a hypothetical — even with a
+correct `GITHUB_TOKEN`. The server builds a combined bundle (public CAs + that cert) and points
+`REQUESTS_CA_BUNDLE` at it automatically; no manual bundle-building needed.
 
 ## Safety model
 

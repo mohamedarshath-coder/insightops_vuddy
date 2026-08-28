@@ -18,6 +18,8 @@ Tools:
     run_static_checks(repo_dir, files)
     run_pytest(repo_dir, test_path, markers="not integration")
     get_repo_mapping(source_path, job_id="", source_content="")
+    create_pr(repo, branch, base, title, body)
+    find_open_pr(repo, search_text)
 
 get_repo_mapping needs DATABRICKS_HOST/DATABRICKS_TOKEN (only that one tool -- everything else
 above works with zero Databricks config at all). It re-implements the same Databricks Repos /
@@ -27,15 +29,20 @@ fallback neither of those has: scanning already-fetched task source for a hardco
 jobs whose task code clones a repo manually in Python rather than using either of Databricks'
 official git-linkage mechanisms (confirmed in practice, twice, building this plugin).
 
+create_pr/find_open_pr talk to the GitHub API directly (via PyGithub), unlike every git_* tool
+above (which only ever runs local `git` CLI commands) -- mirrors workflow/git_workflow.py's
+GitHubClient from the Claude Code side of this plugin, so opsbuddy-fix's Phase 7 (PR creation) and
+Phase 4 (PR dedup) have a real MCP-preferred path bundled with this plugin, instead of depending on
+a separately-configured `github` MCP server whose exact tool contract was never verified against
+this skill's needs. This server still never merges or closes anything -- PR creation only.
+
 Every path argument (target_dir, repo_dir) must resolve underneath OPSBUDDY_MCP_WORKDIR (default:
 a workdir/ folder next to this file) -- this server refuses to touch anything outside it, so a
 bad or malicious argument can't walk it into unrelated parts of the filesystem.
 
-Auth: GITHUB_TOKEN (optional -- only needed for HTTPS clone/push against a private repo; SSH
-remotes need nothing from this server). Nothing here talks to the GitHub API directly; that's
-still the "github" MCP server's job (create_pull_request, etc.) -- this one only ever runs local
-`git` CLI commands, mirroring workflow/git_workflow.py's GitRepoManager from the Claude Code side
-of this plugin.
+Auth: GITHUB_TOKEN -- optional for the git_* tools (only needed for HTTPS clone/push against a
+private repo; SSH remotes need nothing from this server), but REQUIRED for create_pr/find_open_pr
+(the GitHub API always needs a token, even for public repos).
 
 Run it:
     pip install -r requirements.txt
@@ -68,6 +75,18 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 # every other tool in this server keeps working with zero Databricks config at all.
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST", "").strip()
 DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN", "").strip()
+
+# Only create_pr/find_open_pr need this -- an extra corporate-proxy root CA (e.g. Zscaler) to
+# trust, on top of the normal public CA bundle. Confirmed in practice: behind a TLS-intercepting
+# corporate proxy, PyGithub's underlying `requests` calls fail outright with
+# SSLCertVerificationError without this, even though GITHUB_TOKEN and everything else is correct.
+# Reuses NODE_EXTRA_CA_CERTS if that's already set for another MCP server on this machine (the
+# official "github" MCP server needs the same cert for the same reason) -- OPSBUDDY_EXTRA_CA_CERT
+# is the primary name, for when this server is the only one that needs it configured.
+EXTRA_CA_CERT = (
+    os.environ.get("OPSBUDDY_EXTRA_CA_CERT", "").strip()
+    or os.environ.get("NODE_EXTRA_CA_CERTS", "").strip()
+)
 
 # Every clone/repo-dir argument must resolve under this directory -- the one guardrail that
 # keeps a bad or malicious path from writing/deleting outside a known sandbox. Defaults to a
@@ -630,6 +649,95 @@ def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "
             "may not be linked to any git repo at all."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# 9. create_pr / 10. find_open_pr
+# ---------------------------------------------------------------------------
+
+
+def _ensure_ca_bundle() -> None:
+    """If EXTRA_CA_CERT is configured, build a combined cert bundle (the normal public CA bundle
+    plus that extra corporate-proxy root CA) once and point REQUESTS_CA_BUNDLE at it, so
+    PyGithub's underlying `requests` calls trust both. Without this, every create_pr/find_open_pr
+    call fails outright behind a TLS-intercepting corporate proxy -- confirmed in practice, not
+    a hypothetical. A no-op if EXTRA_CA_CERT isn't set, the file doesn't exist, or the caller
+    already set REQUESTS_CA_BUNDLE explicitly (never override an explicit choice)."""
+    if not EXTRA_CA_CERT or not os.path.exists(EXTRA_CA_CERT):
+        return
+    if os.environ.get("REQUESTS_CA_BUNDLE"):
+        return
+    combined_path = WORKDIR / ".combined-ca-bundle.pem"
+    if not combined_path.exists():
+        import certifi
+
+        with open(certifi.where(), "r", encoding="utf-8") as f:
+            base_bundle = f.read()
+        with open(EXTRA_CA_CERT, "r", encoding="utf-8") as f:
+            extra_cert = f.read()
+        combined_path.write_text(base_bundle + "\n" + extra_cert, encoding="utf-8")
+    os.environ["REQUESTS_CA_BUNDLE"] = str(combined_path)
+
+
+def _github_client():
+    """Lazy PyGithub client -- only constructed when create_pr/find_open_pr are actually
+    called, so a missing GITHUB_TOKEN never affects any git_* tool, none of which need it for
+    public repos or SSH remotes."""
+    if not GITHUB_TOKEN:
+        raise RuntimeError(
+            "GITHUB_TOKEN must be set for create_pr/find_open_pr (the GitHub API always needs "
+            "a token, unlike git_clone/git_push which can work without one for public repos "
+            "or SSH remotes)."
+        )
+    _ensure_ca_bundle()
+    from github import Auth, Github
+
+    return Github(auth=Auth.Token(GITHUB_TOKEN))
+
+
+@mcp.tool()
+def create_pr(repo: str, branch: str, base: str, title: str, body: str) -> dict:
+    """Create a GitHub pull request via the GitHub API (head=branch, base=base, on `repo` as
+    "owner/name"). Returns pr_number/pr_url on success. Does not touch Jira at all -- handle
+    ticket transitions/comments separately (e.g. via the Atlassian connector). Never merges or
+    closes anything -- this plugin's entire design never merges its own PR."""
+    try:
+        gh = _github_client()
+    except RuntimeError as exc:
+        return {"pr_number": None, "pr_url": None, "error": str(exc)}
+    try:
+        gh_repo = gh.get_repo(repo)
+        pr = gh_repo.create_pull(title=title, body=body, head=branch, base=base)
+        return {"pr_number": pr.number, "pr_url": pr.html_url, "error": None}
+    except Exception as exc:  # noqa: BLE001 - PyGithub raises its own exception hierarchy; a
+        # clean {"error": ...} beats a caller having to catch a library-specific exception type
+        return {"pr_number": None, "pr_url": None, "error": str(exc)}
+
+
+@mcp.tool()
+def find_open_pr(repo: str, search_text: str) -> dict:
+    """Search open PRs on `repo` (owner/name) for one whose title or branch name contains
+    search_text (e.g. a run ID or ticket key) -- for opsbuddy-fix Phase 4's dedup check, so it
+    reuses an existing PR for this incident instead of opening a duplicate."""
+    empty = {"found": False, "pr_number": None, "pr_url": None, "branch": None}
+    try:
+        gh = _github_client()
+    except RuntimeError as exc:
+        return {**empty, "error": str(exc)}
+    try:
+        gh_repo = gh.get_repo(repo)
+        for pr in gh_repo.get_pulls(state="open"):
+            if search_text in (pr.title or "") or search_text in (pr.head.ref or ""):
+                return {
+                    "found": True,
+                    "pr_number": pr.number,
+                    "pr_url": pr.html_url,
+                    "branch": pr.head.ref,
+                    "error": None,
+                }
+        return {**empty, "error": None}
+    except Exception as exc:  # noqa: BLE001 - see create_pr
+        return {**empty, "error": str(exc)}
 
 
 def _run_http() -> None:

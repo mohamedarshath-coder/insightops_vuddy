@@ -45,7 +45,7 @@ fails/times out — never block the run on an MCP server being present:
   adjust if it differs.
 - `opsbuddy-git-ops`, from **this** plugin's own bundled `mcp-server/` (see this repo's top-level
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
-  `run_static_checks`, `run_pytest`.
+  `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`.
 - The **Atlassian connector** (`mcp__claude_ai_Atlassian__*`) — `getVisibleJiraProjects`,
   `searchJiraIssuesUsingJql`, `createJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`,
   `getJiraProjectIssueTypesMetadata`. Every call needs `cloudId` — resolve it **once** per run via
@@ -57,10 +57,10 @@ fails/times out — never block the run on an MCP server being present:
   needs a channel ID (`SLACK_CHANNEL_ID` or similar), which `send-incident-summary` doesn't need
   today since it posts via `SLACK_WEBHOOK_URL` instead.
 
-PR creation (Phase 7) and the Phase 10 Databricks incident-log write still have **no MCP path** —
-Phase 7 stays Bash-only even though a `github` MCP server may be registered separately (its tool
-contract isn't verified against this skill's needs), and there is no MCP write tool anywhere for
-the incident-log table.
+The Phase 10 Databricks incident-log write still has **no MCP path anywhere** — Bash-only,
+regardless of client. (Phase 7 PR creation now has a verified MCP path too — `create_pr`/
+`find_open_pr` above — separate from any `github` MCP server that may also be registered; that
+one's tool contract still isn't verified against this skill's needs, so it's not wired in here.)
 
 **Argument**: a Databricks job run ID (e.g. `48213`). If only a job ID is known:
 ```
@@ -291,8 +291,13 @@ giving up:
 Only if this heuristic also finds nothing → **stop**, report the error plainly rather than
 guessing at a repo.
 
-**Dedup — check for an existing open PR for this run before creating anything**, e.g. via
-PyGithub's `get_pulls(state="open")` filtered by title/branch referencing this run/job ID.
+**Dedup — check for an existing open PR for this run before creating anything:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__find_open_pr(repo="<owner/repo>", search_text="<run_id or job_id>")
+
+# Bash fallback -- e.g. via PyGithub's get_pulls(state="open") filtered by title/branch
+```
 Found one → reuse it, skip straight to Phase 8. None found → proceed:
 ```
 # MCP-preferred (opsbuddy-git-ops)
@@ -334,19 +339,26 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/git_workflow.py push --repo-dir <repo_dir>
 
 ## Phase 7 — Pull Request
 
-Bash-only for now — no MCP-preferred path is wired here yet, even if a `github` MCP server is
-registered separately (its tool contract isn't verified against this skill; see
-this repo's top-level README.md).
+**Always pass the repo explicitly** — never rely on a default, since the job's actual repo
+(resolved in Phase 4) can differ from any fixed default (confirmed in practice: a run against a
+different repo silently tried to open a PR on the wrong one until this was fixed):
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__create_pr(
+  repo="<owner/repo resolved in Phase 4>", branch="<TICKET-KEY>/hotfix-<slug>",
+  base="<branch resolved in Phase 4>", title="[<TICKET-KEY>] <job_name> <ERROR_CATEGORY> fix",
+  body="<summary of root cause, fix, and validation — same content the Bash fallback auto-generates>")
 
-**Always pass `--repo`** — `create-pr` defaults to `$GITHUB_REPO`, which will be wrong whenever
-the job's actual repo (resolved in Phase 4) differs from that default (confirmed in practice: a
-run against a different repo silently tried to open a PR on the wrong one until this was fixed):
-```bash
+# Bash fallback (also handles the Jira transition/comment below as a side effect -- the MCP
+# path above does not touch Jira at all, so do that yourself as a separate step if you used it)
 cd <repo_dir> && python ${CLAUDE_PLUGIN_ROOT}/workflow/git_workflow.py create-pr \
   --branch <TICKET-KEY>/hotfix-<slug> --jira-id <TICKET-KEY> \
   --repo <owner/repo resolved in Phase 4> --base <branch resolved in Phase 4>
 ```
-Capture the PR URL and number.
+Capture the PR URL and number. **If you used the MCP path**, also transition the Jira ticket
+(e.g. to "In Review") and comment the PR link — the Bash fallback does this automatically as
+part of `create-pr`, but `create_pr` deliberately doesn't touch Jira at all, so it's your
+responsibility to do it explicitly when using that path.
 
 ## Phase 8 — Automated PR Review
 

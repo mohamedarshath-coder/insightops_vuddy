@@ -13,3 +13,6 @@ pytest
 
 # Only needed for get_repo_mapping -- every other tool works with zero Databricks config.
 databricks-sdk>=0.30.0
+
+# Only needed for create_pr/find_open_pr -- every git_* tool works without it.
+PyGithub>=2.0.0
