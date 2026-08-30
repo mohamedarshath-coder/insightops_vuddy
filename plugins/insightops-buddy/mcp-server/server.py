@@ -821,6 +821,11 @@ def post_slack_alert(
     layout) so the message looks identical regardless of which client sent it."""
     if not SLACK_WEBHOOK_URL:
         return {"sent": False, "error": "SLACK_WEBHOOK_URL must be set for post_slack_alert."}
+    # Same CA-bundle fix create_pr/find_open_pr already needed, for the same reason: behind a
+    # TLS-intercepting corporate proxy, requests.post() fails outright with
+    # SSLCertVerificationError against the public CA bundle alone -- confirmed in practice, this
+    # was missing here and broke Slack alerts on a Desktop run behind Zscaler.
+    _ensure_ca_bundle()
     incident = {
         "Jira Ticket": jira_ticket_id,
         "Databricks Run ID": databricks_run_id,
@@ -864,10 +869,28 @@ def _sql_literal(value) -> str:
 @mcp.tool()
 def log_incident(record: dict) -> dict:
     """Write one row into the Databricks ops incident-log table (DATABRICKS_OPS_INCIDENT_TABLE,
-    default dev.ops_incidents.incident_log). `record`'s keys must match the real table's actual
-    columns exactly -- see the opsbuddy-fix skill's Phase 10 section for the verified shape
-    (this table predates this plugin and doesn't use this skill's own field names one-for-one).
-    Mirrors python/utils/databricks_conn.py's insert_ops_incident_log exactly (same SQL
+    default dev.ops_incidents.incident_log). This table predates this plugin (built for an
+    earlier email-alert design, before the pivot to Slack) so its columns don't match this
+    skill's own vocabulary one-for-one -- don't rely on the opsbuddy-fix skill being loaded to
+    know the shape; confirmed in practice that it can be missing from context when this tool is
+    called. `record` must have exactly these keys (verified via DESCRIBE TABLE and a real
+    insert/read-back/delete cycle):
+
+        incident_id (str), jira_ticket_id (str), databricks_job_id (int), databricks_run_id (int),
+        job_name (str), task_key (str), error_category (str), root_cause_summary (str),
+        stack_trace_excerpt (str), code_fix_possible (bool), target_repo (str), branch_name (str),
+        commit_sha (str), pr_url (str), pr_review_verdict (str), execution_status (str),
+        severity (str), detected_at (ISO timestamp str -- no default, insert fails without it),
+        resolved_at (ISO timestamp str, omit this key entirely if not yet resolved),
+        email_sent (bool -- this table has no Slack-specific column; reuse this one to mean "an
+        alert was sent" regardless of channel), email_recipients (str -- the Slack channel or
+        webhook target actually used, or "").
+
+    Use "" for any string field with no value, not null/None, except detected_at (required) and
+    resolved_at (omit the key). A missing/misnamed column fails with UNRESOLVED_COLUMN or
+    DELTA_INSERT_COLUMN_MISMATCH naming the real column -- if a future table redesign changes
+    these names, update this docstring to match rather than guessing from the error alone each
+    time. Mirrors python/utils/databricks_conn.py's insert_ops_incident_log exactly (same SQL
     construction, same `loaded_at` default) so behavior stays identical to the Bash path."""
     if not DATABRICKS_SQL_WAREHOUSE_ID:
         return {
