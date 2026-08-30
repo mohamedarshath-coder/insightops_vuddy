@@ -108,6 +108,42 @@ CONFIDENCE: <high|medium|low>
 | Either reports `CONFIDENCE: low` | Surface that explicitly regardless of agreement |
 | **One agent errors out entirely** (a tool denial, crash, or timeout — no verdict returned at all, not a low-confidence one) | This is **not** the same as agreement or disagreement — don't silently treat it as either. Confirmed in practice: a permission-classifier denial killed one of two parallel Bash-using agents mid-run while the other completed normally. First, **retry only the failed agent once** (the surviving one already has a real answer — no need to redo it). If the retry also errors: you now have exactly one real verdict, not two independent ones — that's a genuinely weaker guarantee than the plugin's own adversarial-double-check design promises, so **say so explicitly** in the report rather than presenting it as a normal reconciled result. Proceed on that single verdict only if it reports `CODE_FIX_POSSIBLE: true` **and** `CONFIDENCE: high` — anything less (low/medium confidence, or `false`) fails closed the same as the low-confidence/disagreement cases above. |
 
+### No subagent-spawning tool available at all (not one erroring out — none present)
+
+Different failure mode from the row above, and it needs different handling. Claude Desktop has
+no subagent-spawning tool of any kind, so this isn't occasional — it's every single run on that
+client. **A disclaimer alone is not enough here — confirmed in practice, at real cost:** a
+Desktop-driven run explicitly said it was "checking whether joins have ambiguous column names,"
+looked directly at the one model that actually had that exact bug, concluded it "looks
+structurally sound," and moved on to a different, less-evidenced hypothesis (a missing
+credential) that it rode all the way to `CODE_FIX_POSSIBLE: false` and a Gate 3.5 halt. It wasn't
+that it lacked information — it looked at the right file for the right reason and still missed
+the defect, because a single pass has no adversary forcing it to double back.
+
+When no subagent tool exists at all, do this instead of a single pass straight to a verdict:
+
+1. Do the normal investigation (fetch source, resolve the repo, read the actual model/macro
+   files) exactly as Step 1 describes.
+2. Form a preliminary verdict — but **do not report it yet**.
+3. **Take a genuine second pass, adversarially, before finalizing anything.** Specifically:
+   re-open every file you concluded "looks fine" or "structurally sound" and re-read it with the
+   explicit goal of finding the opposite of your first conclusion. For each category you
+   considered and ruled out, ask "what would this look like if it WERE the cause?" and check
+   for that pattern specifically — don't just re-skim for a general impression a second time.
+   If your preliminary verdict is anything other than a specific, confirmed code defect (e.g.
+   it's an environment/credential hypothesis, or "no obvious cause found"), that is itself the
+   signal to look harder at the code before accepting it, not a stopping point.
+4. Only after that second pass, report the verdict — and always disclose that this substituted a
+   self-adversarial second pass for genuine independent agents, exactly as before, but now also
+   state explicitly whether the second pass changed the preliminary verdict or confirmed it. A
+   verdict that survived genuine self-adversarial re-checking is more trustworthy than one that
+   was never re-examined at all, even without a second independent mind.
+
+This does not fully replace two truly independent agents — a single mind checking its own work
+twice still shares whatever blind spot caused the miss the first time. But it closes the specific
+gap observed in practice: a plausible-sounding alternative hypothesis winning out over a defect
+that was already sitting in view.
+
 ---
 
 ## Step 4 — Report
