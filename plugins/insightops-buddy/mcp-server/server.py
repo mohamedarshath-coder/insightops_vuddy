@@ -24,6 +24,23 @@ Tools:
     write_file(repo_dir, path, content)
     post_slack_alert(jira_ticket_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status)
     log_incident(record)
+    get_job_run(run_id)
+    get_latest_failed_run(job_id)
+    trigger_job_run(job_id, timeout_seconds=600, force=False)
+
+get_job_run/get_latest_failed_run/trigger_job_run close the last two Bash-only steps in the whole
+pipeline: Phase 1's telemetry fetch and Gate 8.5's real-verification re-run had no MCP path in
+THIS plugin at all -- only the separate databricks-job-lineage plugin covered similar ground
+(get_job_run, get_latest_failed_run, trigger_job_run gated behind its own
+DATABRICKS_ALLOW_JOB_TRIGGER), which this plugin was never meant to depend on for the same reason
+get_repo_mapping/create_pr aren't either: that plugin's tool contract isn't verified against this
+skill's needs, and it might not even be installed. Confirmed in practice: without an MCP path,
+Gate 8.5's real re-run on a live Desktop-driven run had to fall back to whatever bash-like sandbox
+Desktop has for other tasks -- a different, less-tested execution environment than this server,
+potentially without the same local env/credentials. These three mirror
+workflow/databricks_workflow.py's DatabricksClient exactly (same telemetry shape, same
+OPSBUDDY_VERIFY_ALLOWLIST/force safety gate on trigger_job_run) so behavior stays identical to the
+Bash path -- Bash is now a true last-resort fallback for every phase, not a silent primary path.
 
 read_file/write_file close the one phase that had no Desktop-side fallback at all: opsbuddy-fix's
 Phase 5 (remediation) needs to actually edit a file in the cloned working tree, and unlike every
@@ -82,6 +99,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
@@ -992,6 +1010,183 @@ def write_file(repo_dir: str, path: str, content: str) -> dict:
     except OSError as exc:
         return {"written": False, "error": str(exc)}
     return {"written": True, "path": str(target), "error": None}
+
+
+# ---------------------------------------------------------------------------
+# 15. get_job_run
+# ---------------------------------------------------------------------------
+
+
+_FAILED_RESULT_STATES = ("FAILED", "TIMEDOUT", "CANCELED")
+_TERMINAL_LIFE_CYCLE_STATES = ("TERMINATED", "SKIPPED", "INTERNAL_ERROR")
+
+
+def _pick_failed_task(run):
+    tasks = run.tasks or []
+    for task in tasks:
+        state = task.state
+        if state and state.result_state and state.result_state.value in _FAILED_RESULT_STATES:
+            return task
+    return tasks[0] if tasks else None
+
+
+def _extract_run_parameters(run) -> dict:
+    params: dict = {}
+    for task in run.tasks or []:
+        notebook_task = getattr(task, "notebook_task", None)
+        if notebook_task and notebook_task.base_parameters:
+            params.update(notebook_task.base_parameters)
+    return params
+
+
+@mcp.tool()
+def get_job_run(run_id: str) -> dict:
+    """Fetch full failure telemetry for a Databricks job run: job/task identifiers, life-cycle
+    and result state, error message, stack trace, cluster ID, run parameters, run page URL.
+    Needs DATABRICKS_HOST/DATABRICKS_TOKEN (same as get_repo_mapping). Mirrors
+    workflow/databricks_workflow.py's DatabricksClient.get_run_failure exactly, so opsbuddy-fix's
+    Phase 1 has a real MCP-preferred path bundled with this plugin instead of depending on the
+    separate databricks-job-lineage plugin being installed."""
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {"error": str(exc)}
+
+    from databricks.sdk.errors import DatabricksError
+
+    try:
+        run = client.jobs.get_run(run_id=int(run_id))
+    except DatabricksError as exc:
+        return {"error": str(exc)}
+    except (TypeError, ValueError):
+        return {"error": f"run_id must be an integer, got {run_id!r}"}
+
+    task = _pick_failed_task(run)
+    error_message, stack_trace = "", ""
+    try:
+        output = client.jobs.get_run_output(run_id=(task.run_id if task else run.run_id))
+        error_message = output.error or ""
+        stack_trace = output.error_trace or ""
+    except Exception:  # noqa: BLE001 - SDK/network edge cases -- degrade gracefully, same as CLI
+        pass
+
+    state = run.state
+    return {
+        "job_id": run.job_id,
+        "run_id": run.run_id,
+        "job_name": run.run_name or "",
+        "task_key": task.task_key if task else "",
+        "life_cycle_state": (
+            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+        ),
+        "result_state": state.result_state.value if state and state.result_state else "-",
+        "error_message": error_message,
+        "stack_trace": stack_trace,
+        "cluster_id": getattr(task, "existing_cluster_id", None) if task else None,
+        "run_page_url": run.run_page_url or "",
+        "parameters": _extract_run_parameters(run),
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 16. get_latest_failed_run
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_latest_failed_run(job_id: str) -> dict:
+    """Resolve the most recent failed run ID for a job (looks back up to 25 runs). Use this
+    when only a job ID is known, not a specific run ID. Mirrors
+    workflow/databricks_workflow.py's get_latest_failed_run exactly."""
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {"run_id": None, "error": str(exc)}
+
+    from databricks.sdk.errors import DatabricksError
+
+    try:
+        for run in client.jobs.list_runs(job_id=int(job_id), active_only=False, limit=25):
+            state = run.state
+            result_state = state.result_state.value if state and state.result_state else None
+            if result_state in _FAILED_RESULT_STATES:
+                return {"run_id": run.run_id, "error": None}
+    except DatabricksError as exc:
+        return {"run_id": None, "error": str(exc)}
+    except (TypeError, ValueError):
+        return {"run_id": None, "error": f"job_id must be an integer, got {job_id!r}"}
+    return {"run_id": None, "error": f"No failed runs found for job {job_id}"}
+
+
+# ---------------------------------------------------------------------------
+# 17. trigger_job_run
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False) -> dict:
+    """Re-run a persistent Databricks job and block until it reaches a terminal state -- used
+    for opsbuddy-fix's Gate 8.5 real-verification step, to prove a fix actually works rather
+    than trusting a code review alone. Real production jobs can write real data, so unless
+    job_id is listed in OPSBUDDY_VERIFY_ALLOWLIST (comma-separated job IDs, or "all"), this
+    refuses to run unless force=True -- which should only be passed after a human has
+    explicitly approved this specific re-run, never auto-approved. This call blocks for up to
+    timeout_seconds (default 600s / 10 minutes) -- same blocking behavior as the CLI it mirrors,
+    workflow/databricks_workflow.py's DatabricksClient.trigger_and_wait."""
+    allowlist = os.environ.get("OPSBUDDY_VERIFY_ALLOWLIST", "").strip()
+    allowed = allowlist.lower() == "all" or str(job_id) in {
+        x.strip() for x in allowlist.split(",") if x.strip()
+    }
+    if not force and not allowed:
+        return {
+            "succeeded": None,
+            "error": (
+                f"job_id {job_id} is not in OPSBUDDY_VERIFY_ALLOWLIST. Re-running a real job "
+                "needs explicit human approval first -- this is not something to auto-approve. "
+                "Once a human has approved it, retry with force=True."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {"succeeded": None, "error": str(exc)}
+
+    from databricks.sdk.errors import DatabricksError
+
+    try:
+        run = client.jobs.run_now(job_id=int(job_id))
+    except DatabricksError as exc:
+        return {"succeeded": None, "error": str(exc)}
+    except (TypeError, ValueError):
+        return {"succeeded": None, "error": f"job_id must be an integer, got {job_id!r}"}
+
+    run_id = run.run_id
+    elapsed = 0
+    poll_interval = 10
+    while elapsed < timeout_seconds:
+        run_status = client.jobs.get_run(run_id=run_id)
+        state = run_status.state
+        life_cycle = (
+            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+        )
+        result_state = state.result_state.value if state and state.result_state else "-"
+        if life_cycle in _TERMINAL_LIFE_CYCLE_STATES:
+            return {
+                "run_id": run_id,
+                "life_cycle_state": life_cycle,
+                "result_state": result_state,
+                "run_page_url": run_status.run_page_url or "",
+                "succeeded": result_state == "SUCCESS",
+                "error": None,
+            }
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+    return {
+        "run_id": run_id,
+        "succeeded": None,
+        "error": f"Run {run_id} did not finish within {timeout_seconds}s",
+    }
 
 
 def _run_http() -> None:

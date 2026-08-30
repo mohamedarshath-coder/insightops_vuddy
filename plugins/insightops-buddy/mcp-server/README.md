@@ -61,10 +61,10 @@ it. Ctrl-C to stop. If `git` isn't on PATH you'll get a `FATAL:` message instead
 This plugin's `.mcp.json` (at `plugins/insightops-buddy/.mcp.json` in this repo) already declares
 `opsbuddy-git-ops` — once the plugin is installed (`/plugin install insightops-buddy@insightops-vuddy`),
 Claude Code starts this server itself; there's nothing to add to `claude_desktop_config.json`
-manually. Confirm with `/mcp` that `opsbuddy-git-ops` is connected and its 14 tools are listed:
+manually. Confirm with `/mcp` that `opsbuddy-git-ops` is connected and its 17 tools are listed:
 `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`, `run_static_checks`,
 `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`, `post_slack_alert`, `log_incident`,
-`read_file`, `write_file`.
+`read_file`, `write_file`, `get_job_run`, `get_latest_failed_run`, `trigger_job_run`.
 
 **If you previously registered this server by hand** directly in `claude_desktop_config.json`
 (e.g. while testing before this repo existed), remove that entry now — otherwise the same server
@@ -89,6 +89,9 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `log_incident` | `INSERT` into the Databricks ops incident-log table via `databricks-sdk`'s SQL Statement Execution API | Phase 10's incident-log write. Needs `DATABRICKS_HOST`/`DATABRICKS_TOKEN` (like `get_repo_mapping`) plus `DATABRICKS_SQL_WAREHOUSE_ID` — reuse the same warehouse ID already configured for the `databricks-lineage` plugin, if one is registered, rather than a new credential. `record`'s keys must match the real table's actual columns exactly — see the `opsbuddy-fix` skill's Phase 10 section for the verified shape. Insert-only, matching the CLI it mirrors. |
 | `read_file` | Read a text file at `path` under an already-cloned `repo_dir` | Whole-file only, UTF-8 text only. |
 | `write_file` | Overwrite (or create) a text file at `path` under `repo_dir` with the given content | Whole-file only — read, edit in full, write back. The one Phase 5 (remediation) needs on Claude Desktop, which has no file-editing tool of its own — confirmed in practice: without this, a Desktop-driven run got as far as creating the hotfix branch and then had no way to actually write the fix. |
+| `get_job_run` | Databricks `jobs.get_run`/`jobs.get_run_output` via `databricks-sdk` | Phase 1's telemetry fetch. Needs `DATABRICKS_HOST`/`DATABRICKS_TOKEN` (like `get_repo_mapping`). |
+| `get_latest_failed_run` | Databricks `jobs.list_runs`, filtered to the most recent failed/timed-out/canceled run | For resolving a run ID when only a job ID is known. |
+| `trigger_job_run` | Databricks `jobs.run_now`, then polls `jobs.get_run` until a terminal state | Gate 8.5's real-verification re-run. Gated on `OPSBUDDY_VERIFY_ALLOWLIST` (comma-separated job IDs, or `"all"`) — without it, refuses unless `force=true` is passed, which should only happen after a human has explicitly approved that specific re-run. Blocks for up to `timeout_seconds` (default 600s) — same blocking behavior as the CLI it mirrors. |
 
 Behind a TLS-intercepting corporate proxy (e.g. Zscaler), `create_pr`/`find_open_pr` need one more
 thing: `OPSBUDDY_EXTRA_CA_CERT` (or it reuses `NODE_EXTRA_CA_CERTS` automatically if that's already

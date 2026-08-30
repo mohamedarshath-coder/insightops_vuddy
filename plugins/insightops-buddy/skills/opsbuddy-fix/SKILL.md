@@ -62,16 +62,24 @@ fails/times out — never block the run on an MCP server being present:
   don't need, since both post via `SLACK_WEBHOOK_URL` instead. Only reach for this if
   `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere.
 
-Phase 7 PR creation and Phase 10 alerting/incident-logging all now have a verified MCP path via
-this plugin's own `opsbuddy-git-ops` — `create_pr`/`find_open_pr`, `post_slack_alert`, and
-`log_incident` respectively — separate from any `github`/generic-`slack` MCP server that may also
-be registered; those other servers' tool contracts aren't verified against this skill's needs, so
-they're not preferred over this plugin's own tools.
+Phase 1 telemetry, Phase 7 PR creation, Gate 8.5's real-verification trigger, and Phase 10
+alerting/incident-logging all now have a verified MCP path via this plugin's own
+`opsbuddy-git-ops` — `get_job_run`/`get_latest_failed_run`, `create_pr`/`find_open_pr`,
+`trigger_job_run`, and `post_slack_alert`/`log_incident` respectively — separate from the
+`databricks-job-lineage`/`github`/generic-`slack` MCP servers that may also be registered; those
+other servers' tool contracts aren't verified against this skill's needs (and `trigger_job_run`
+here doesn't depend on `databricks-job-lineage`'s own trigger being enabled via its
+`DATABRICKS_ALLOW_JOB_TRIGGER` flag), so this plugin's own tools are preferred throughout. This
+was the last place Bash was still a silent primary path rather than a genuine last resort:
+confirmed in practice, Gate 8.5's real re-run on a Desktop-driven run had to fall back to
+whatever bash-like sandbox Desktop has for unrelated tasks, since no MCP tool existed for it —
+a different, less-tested execution path than this server, potentially without the same local
+env/credentials.
 
 **Argument**: a Databricks job run ID (e.g. `48213`). If only a job ID is known:
 ```
-# MCP-preferred (databricks-lineage)
-mcp__plugin_databricks-job-lineage_databricks-lineage__get_latest_failed_run(job_id="<job-id>")
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_latest_failed_run(job_id="<job-id>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py get-latest-failed-run --job-id <job-id>
@@ -156,8 +164,8 @@ result from either path above), ask the user for the real one rather than assumi
 ## Phase 1 — Telemetry
 
 ```
-# MCP-preferred (databricks-lineage)
-mcp__plugin_databricks-job-lineage_databricks-lineage__get_job_run(run_id="$ARGUMENTS")
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_job_run(run_id="$ARGUMENTS")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py get-run-failure --run-id $ARGUMENTS
@@ -402,15 +410,17 @@ to git — check which one before assuming `sync-repo` will work:**
 - **Databricks Repos checkout** (`source_path` under `/Repos/...`) → the normal path:
   ```bash
   python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py sync-repo --repo-url <repo_url> --branch <hotfix branch>
-  python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py trigger-and-wait --job-id <job_id> --timeout 600
   ```
-  `databricks-lineage` has no write tool for repointing a Repo's checked-out branch, so
-  `sync-repo` above is Bash-only regardless of client. Once the checkout is repointed, triggering
-  and polling the run itself can use MCP instead:
+  No tool anywhere (this plugin or `databricks-lineage`) can repoint a Repo's checked-out branch,
+  so `sync-repo` above is Bash-only regardless of client. Once the checkout is repointed,
+  triggering and blocking on the run itself has a real MCP path bundled with this plugin:
   ```
-  # MCP-preferred (databricks-lineage; only present when its DATABRICKS_ALLOW_JOB_TRIGGER=true)
-  mcp__plugin_databricks-job-lineage_databricks-lineage__trigger_job_run(job_id="<job_id>")
-  mcp__plugin_databricks-job-lineage_databricks-lineage__get_job_run(run_id="<new run_id>")   # poll until result_state is set
+  # MCP-preferred (this plugin's own opsbuddy-git-ops -- blocks until terminal state, same as
+  # the CLI it mirrors; gated on OPSBUDDY_VERIFY_ALLOWLIST/force the same way)
+  mcp__plugin_insightops-buddy_opsbuddy-git-ops__trigger_job_run(job_id="<job_id>", timeout_seconds=600, force=<true only after explicit human approval>)
+
+  # Bash fallback
+  python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py trigger-and-wait --job-id <job_id> --timeout 600 --force
   ```
 - **Job-level Git source** (the job's own `settings.git_source` points at a repo — no `/Repos/...`
   checkout exists at all; `sync-repo` will fail with "path doesn't exist" here — confirmed in
