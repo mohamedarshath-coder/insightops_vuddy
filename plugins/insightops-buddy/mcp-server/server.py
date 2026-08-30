@@ -301,6 +301,27 @@ def _tool_result(tool: str, proc: subprocess.CompletedProcess) -> dict:
     }
 
 
+def _environment_gap_hint(result: dict) -> dict:
+    """pytest here runs inside THIS server's own venv (provisioned from this server's own
+    pyproject.toml), which has none of the target repo's actual third-party dependencies --
+    confirmed in practice: a genuinely correct fix in a module that imports e.g.
+    snowflake-connector-python fails collection with ModuleNotFoundError, reported as a plain
+    FAIL indistinguishable from a real logic bug. Flag that distinction rather than silently
+    letting a tooling gap look like a code defect -- does not fix the gap, only labels it."""
+    if result["passed"] or "ModuleNotFoundError" not in (result.get("stdout", "") + result.get("stderr", "")):
+        return result
+    return {
+        **result,
+        "possible_environment_gap": (
+            "This failure is a ModuleNotFoundError, not a test assertion failure -- it may mean "
+            "the target repo's own dependency isn't installed in this server's sandboxed venv "
+            "(which only has this server's own dependencies), not that the fix is wrong. Verify "
+            "by running the same test in an environment with the target repo's actual "
+            "requirements installed before treating this as a real REMEDIATION_FAILED."
+        ),
+    }
+
+
 def _databricks_client():
     """Lazy Databricks client -- only constructed when get_repo_mapping is actually called, so a
     missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither."""
@@ -498,19 +519,19 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         }
 
     results = []
-    for tool_args in (
-        ["black", "--check", *py_files],
-        ["isort", "--check", *py_files],
-        ["flake8", "--max-line-length=120", *py_files],
-        [sys.executable, "-m", "py_compile", *py_files],
+    for label, tool_args in (
+        ("black", ["black", "--check", *py_files]),
+        ("isort", ["isort", "--check", *py_files]),
+        ("flake8", ["flake8", "--max-line-length=120", *py_files]),
+        ("py_compile", [sys.executable, "-m", "py_compile", *py_files]),
     ):
         try:
             proc = _run(tool_args, cwd=cwd)
         except FileNotFoundError as exc:
-            results.append({"tool": tool_args[0], "passed": False, "returncode": None,
+            results.append({"tool": label, "passed": False, "returncode": None,
                              "stdout": "", "stderr": f"not installed/found: {exc}"})
             continue
-        results.append(_tool_result(tool_args[0], proc))
+        results.append(_tool_result(label, proc))
 
     for f in py_files:
         stem = Path(f).stem
@@ -521,7 +542,7 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
                     ["pytest", str(candidate.relative_to(cwd)), "-m", "not integration", "-v"],
                     cwd=cwd,
                 )
-                results.append(_tool_result(f"pytest:{candidate.name}", proc))
+                results.append(_environment_gap_hint(_tool_result(f"pytest:{candidate.name}", proc)))
             except FileNotFoundError as exc:
                 results.append({"tool": f"pytest:{candidate.name}", "passed": False,
                                  "returncode": None, "stdout": "", "stderr": str(exc)})
@@ -554,12 +575,12 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
         proc = _run(["pytest", test_path, "-m", markers, "-v"], cwd=cwd)
     except FileNotFoundError as exc:
         return {"passed": False, "stdout": "", "stderr": str(exc), "returncode": None}
-    return {
+    return _environment_gap_hint({
         "passed": proc.returncode == 0,
         "returncode": proc.returncode,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
-    }
+    })
 
 
 # ---------------------------------------------------------------------------
