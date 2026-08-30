@@ -45,22 +45,28 @@ fails/times out — never block the run on an MCP server being present:
   adjust if it differs.
 - `opsbuddy-git-ops`, from **this** plugin's own bundled `mcp-server/` (see this repo's top-level
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
-  `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`.
+  `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
+  `post_slack_alert`, `log_incident`, `read_file`, `write_file`. This is the only tool set in this
+  list whose contract is actually verified against this skill's needs (built and tested for it
+  specifically) — prefer it over a generically-registered server below whenever both could do the
+  same job.
 - The **Atlassian connector** (`mcp__claude_ai_Atlassian__*`) — `getVisibleJiraProjects`,
   `searchJiraIssuesUsingJql`, `createJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`,
   `getJiraProjectIssueTypesMetadata`. Every call needs `cloudId` — resolve it **once** per run via
   `mcp__claude_ai_Atlassian__getAccessibleAtlassianResources` (or try the site hostname, e.g.
   `yourorg.atlassian.net`, directly as `cloudId` first) and reuse it for every Jira call below.
-- A **Slack MCP server** (e.g. `@modelcontextprotocol/server-slack`, if registered) — `slack_post_message`.
-  Unlike the tools above, this one's exact tool name/args aren't verified against your installed
-  server in this session — confirm against its actual tool list before relying on it, and note it
-  needs a channel ID (`SLACK_CHANNEL_ID` or similar), which `send-incident-summary` doesn't need
-  today since it posts via `SLACK_WEBHOOK_URL` instead.
+- A **generic Slack MCP server** (e.g. `@modelcontextprotocol/server-slack`, if registered) —
+  `slack_post_message`. Lower priority than this plugin's own `post_slack_alert` above: this one's
+  exact tool name/args aren't verified against your installed server in this session, and it needs
+  a channel ID (`SLACK_CHANNEL_ID` or similar) that `post_slack_alert`/`send-incident-summary`
+  don't need, since both post via `SLACK_WEBHOOK_URL` instead. Only reach for this if
+  `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere.
 
-The Phase 10 Databricks incident-log write still has **no MCP path anywhere** — Bash-only,
-regardless of client. (Phase 7 PR creation now has a verified MCP path too — `create_pr`/
-`find_open_pr` above — separate from any `github` MCP server that may also be registered; that
-one's tool contract still isn't verified against this skill's needs, so it's not wired in here.)
+Phase 7 PR creation and Phase 10 alerting/incident-logging all now have a verified MCP path via
+this plugin's own `opsbuddy-git-ops` — `create_pr`/`find_open_pr`, `post_slack_alert`, and
+`log_incident` respectively — separate from any `github`/generic-`slack` MCP server that may also
+be registered; those other servers' tool contracts aren't verified against this skill's needs, so
+they're not preferred over this plugin's own tools.
 
 **Argument**: a Databricks job run ID (e.g. `48213`). If only a job ID is known:
 ```
@@ -449,23 +455,28 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment-rich <TICKET-KEY>
 ## Phase 10 — Alerting & Error Logging
 
 ```
-# MCP-preferred (a Slack MCP server, if registered -- tool name/args unverified in this session,
-# confirm against your installed server's actual tool list; needs a channel ID, unlike the
-# Bash path below which posts via a pre-configured incoming webhook)
-mcp__slack__slack_post_message(channel_id="<incident-channel-id>",
-  text="opsbuddy-fix: <TICKET-KEY> <ERROR_CATEGORY> — <EXECUTION_STATUS>. PR: <pr_url>. Review: <mode-a-verdict>.")
+# MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via a pre-configured incoming
+# webhook, same as the Bash path; needs no channel ID unlike a generic Slack MCP server would)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
+  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
+  pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>", execution_status="<EXECUTION_STATUS>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
   --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
   --pr-url <pr_url> --verdict <mode-a-verdict> --status <EXECUTION_STATUS>
 ```
-No MCP write tool exists anywhere for the Databricks incident-log table — this step is Bash-only
-regardless of client:
-```bash
+The Databricks incident-log write now has a real MCP path too — this closed Desktop's last
+Phase-10 gap (confirmed in practice: a Desktop-driven run correctly reported this step as
+unavailable, since only a Bash fallback existed before):
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__log_incident(record={...})   # exact shape below
+
+# Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py log-incident --json-file <path-to-record.json>
 ```
-**The JSON record's keys must match the real table's actual columns exactly** — this table
+**The record's keys must match the real table's actual columns exactly** — this table
 predates this plugin (built for an earlier email-alert version of this design, before the pivot
 to Slack), so its column names don't match this skill's own vocabulary one-for-one. Verified
 against the real table (`dev.ops_incidents.incident_log`, or whatever `DATABRICKS_OPS_INCIDENT_TABLE`

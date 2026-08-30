@@ -22,6 +22,8 @@ Tools:
     find_open_pr(repo, search_text)
     read_file(repo_dir, path)
     write_file(repo_dir, path, content)
+    post_slack_alert(jira_ticket_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status)
+    log_incident(record)
 
 read_file/write_file close the one phase that had no Desktop-side fallback at all: opsbuddy-fix's
 Phase 5 (remediation) needs to actually edit a file in the cloned working tree, and unlike every
@@ -31,6 +33,16 @@ diagnosed the fix correctly, created the hotfix branch, and then had nothing to 
 with -- it had to halt and hand off to a human for a one-line edit. These two tools are Claude
 Code's Read/Edit, exposed over MCP, scoped the same way every other tool here is (must resolve
 under the repo's own working tree, whole-file only, no shell involved).
+
+post_slack_alert/log_incident close Phase 10's Desktop-side gap the same way: that phase's Slack
+alert and Databricks incident-log write had only ever had a Bash fallback (workflow/slack_workflow.py,
+workflow/databricks_workflow.py log-incident) -- Desktop has no Bash, so a Desktop-driven run could
+report Phase 10 as done and silently mean "nothing was actually sent or logged." Confirmed in
+practice: a real Desktop-driven multi-bug run got all the way through PR creation and review, then
+had to report both alerting and incident-logging as unavailable rather than fake having done them --
+which is the right call for a tool gap, but still a gap. These two mirror workflow/slack_workflow.py's
+SlackClient and python/utils/databricks_conn.py's insert_ops_incident_log exactly (same payload
+shape, same SQL construction) so behavior stays identical to the Code-driven path.
 
 get_repo_mapping needs DATABRICKS_HOST/DATABRICKS_TOKEN (only that one tool -- everything else
 above works with zero Databricks config at all). It re-implements the same Databricks Repos /
@@ -98,6 +110,18 @@ EXTRA_CA_CERT = (
     os.environ.get("OPSBUDDY_EXTRA_CA_CERT", "").strip()
     or os.environ.get("NODE_EXTRA_CA_CERTS", "").strip()
 )
+
+# Only post_slack_alert needs this -- every other tool works with it unset.
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+
+# Only log_incident needs these -- every other tool works with them unset. The warehouse ID is
+# the same value already used by the databricks-lineage plugin's DATABRICKS_SQL_WAREHOUSE_ID (if
+# that's registered on this machine), not a new credential -- reuse it rather than configuring a
+# second one. The table name mirrors python/utils/databricks_conn.py's own default exactly.
+DATABRICKS_SQL_WAREHOUSE_ID = os.environ.get("DATABRICKS_SQL_WAREHOUSE_ID", "").strip()
+DATABRICKS_OPS_INCIDENT_TABLE = os.environ.get(
+    "DATABRICKS_OPS_INCIDENT_TABLE", "dev.ops_incidents.incident_log"
+).strip()
 
 # Every clone/repo-dir argument must resolve under this directory -- the one guardrail that
 # keeps a bad or malicious path from writing/deleting outside a known sandbox. Defaults to a
@@ -769,7 +793,120 @@ def find_open_pr(repo: str, search_text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 11. read_file / 12. write_file
+# 11. post_slack_alert
+# ---------------------------------------------------------------------------
+
+
+def _incident_summary_blocks(incident: dict) -> list:
+    fields = [
+        {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"} for key, value in incident.items()
+    ]
+    return [
+        {"type": "header", "text": {"type": "plain_text", "text": "opsbuddy-fix incident summary"}},
+        {"type": "section", "fields": fields},
+    ]
+
+
+@mcp.tool()
+def post_slack_alert(
+    jira_ticket_id: str = "",
+    databricks_run_id: str = "",
+    error_category: str = "",
+    pr_url: str = "",
+    pr_review_verdict: str = "",
+    execution_status: str = "",
+) -> dict:
+    """Send the standard opsbuddy-fix Phase 10 Slack incident summary via SLACK_WEBHOOK_URL.
+    Mirrors workflow/slack_workflow.py's send-incident-summary exactly (same fields, same block
+    layout) so the message looks identical regardless of which client sent it."""
+    if not SLACK_WEBHOOK_URL:
+        return {"sent": False, "error": "SLACK_WEBHOOK_URL must be set for post_slack_alert."}
+    incident = {
+        "Jira Ticket": jira_ticket_id,
+        "Databricks Run ID": databricks_run_id,
+        "Error Category": error_category,
+        "PR": pr_url,
+        "Review Verdict": pr_review_verdict,
+        "Execution Status": execution_status,
+    }
+    text = f"[opsbuddy-fix] {jira_ticket_id or databricks_run_id} -- {execution_status or 'update'}"
+    import requests
+
+    try:
+        response = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": text, "blocks": _incident_summary_blocks(incident)},
+            timeout=10,
+        )
+    except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+        return {"sent": False, "error": str(exc)}
+    if response.status_code != 200:
+        return {"sent": False, "error": f"Slack webhook returned {response.status_code}: {response.text}"}
+    return {"sent": True, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# 12. log_incident
+# ---------------------------------------------------------------------------
+
+
+def _sql_literal(value) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("'", "''")
+    return f"'{escaped}'"
+
+
+@mcp.tool()
+def log_incident(record: dict) -> dict:
+    """Write one row into the Databricks ops incident-log table (DATABRICKS_OPS_INCIDENT_TABLE,
+    default dev.ops_incidents.incident_log). `record`'s keys must match the real table's actual
+    columns exactly -- see the opsbuddy-fix skill's Phase 10 section for the verified shape
+    (this table predates this plugin and doesn't use this skill's own field names one-for-one).
+    Mirrors python/utils/databricks_conn.py's insert_ops_incident_log exactly (same SQL
+    construction, same `loaded_at` default) so behavior stays identical to the Bash path."""
+    if not DATABRICKS_SQL_WAREHOUSE_ID:
+        return {
+            "logged": False,
+            "error": (
+                "DATABRICKS_SQL_WAREHOUSE_ID must be set for log_incident (no other tool in "
+                "this server needs it) -- reuse the same value already configured for the "
+                "databricks-lineage plugin's DATABRICKS_SQL_WAREHOUSE_ID, if one is registered."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {"logged": False, "error": str(exc)}
+
+    columns = list(record.keys()) + ["loaded_at"]
+    values = [_sql_literal(v) for v in record.values()] + ["current_timestamp()"]
+    sql = (
+        f"INSERT INTO {DATABRICKS_OPS_INCIDENT_TABLE} ({', '.join(columns)}) "
+        f"VALUES ({', '.join(values)})"
+    )
+
+    from databricks.sdk.errors import DatabricksError
+
+    try:
+        response = client.statement_execution.execute_statement(
+            statement=sql, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="30s"
+        )
+    except DatabricksError as exc:
+        return {"logged": False, "error": str(exc)}
+
+    status = response.status
+    if status and status.state and status.state.value != "SUCCEEDED":
+        return {"logged": False, "error": f"Databricks SQL statement failed: {status}"}
+    return {"logged": True, "incident_id": record.get("incident_id"), "error": None}
+
+
+# ---------------------------------------------------------------------------
+# 13. read_file / 14. write_file
 # ---------------------------------------------------------------------------
 
 

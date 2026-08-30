@@ -61,9 +61,10 @@ it. Ctrl-C to stop. If `git` isn't on PATH you'll get a `FATAL:` message instead
 This plugin's `.mcp.json` (at `plugins/insightops-buddy/.mcp.json` in this repo) already declares
 `opsbuddy-git-ops` — once the plugin is installed (`/plugin install insightops-buddy@insightops-vuddy`),
 Claude Code starts this server itself; there's nothing to add to `claude_desktop_config.json`
-manually. Confirm with `/mcp` that `opsbuddy-git-ops` is connected and its 12 tools are listed:
+manually. Confirm with `/mcp` that `opsbuddy-git-ops` is connected and its 14 tools are listed:
 `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`, `run_static_checks`,
-`run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`, `read_file`, `write_file`.
+`run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`, `post_slack_alert`, `log_incident`,
+`read_file`, `write_file`.
 
 **If you previously registered this server by hand** directly in `claude_desktop_config.json`
 (e.g. while testing before this repo existed), remove that entry now — otherwise the same server
@@ -84,6 +85,8 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `get_repo_mapping` | Databricks Repos list / job `git_source` lookup via `databricks-sdk`, or a regex scan of a passed-in `source_content` string | The only tool needing `DATABRICKS_HOST`/`DATABRICKS_TOKEN` — everything else works with neither set. Re-implements the same lookup `databricks-job-lineage`'s own `get_repo_mapping` does (so this plugin doesn't depend on that one being installed), plus a third fallback neither has: scanning already-fetched task source for a hardcoded git URL, for jobs whose task code clones a repo manually rather than using either official Databricks git-linkage mechanism. |
 | `create_pr` | GitHub API `create_pull` via PyGithub | Requires `GITHUB_TOKEN` (unlike every `git_*` tool above, which can work without one for public repos/SSH remotes — the GitHub API always needs a token). Never merges or closes anything. |
 | `find_open_pr` | GitHub API `get_pulls(state="open")` via PyGithub, filtered by title/branch substring | For Phase 4's PR-dedup check — reuse an existing PR for this incident instead of opening a duplicate. |
+| `post_slack_alert` | `POST` to `SLACK_WEBHOOK_URL` | Phase 10's alert. Mirrors `workflow/slack_workflow.py`'s `send-incident-summary` exactly (same fields, same block layout). |
+| `log_incident` | `INSERT` into the Databricks ops incident-log table via `databricks-sdk`'s SQL Statement Execution API | Phase 10's incident-log write. Needs `DATABRICKS_HOST`/`DATABRICKS_TOKEN` (like `get_repo_mapping`) plus `DATABRICKS_SQL_WAREHOUSE_ID` — reuse the same warehouse ID already configured for the `databricks-lineage` plugin, if one is registered, rather than a new credential. `record`'s keys must match the real table's actual columns exactly — see the `opsbuddy-fix` skill's Phase 10 section for the verified shape. Insert-only, matching the CLI it mirrors. |
 | `read_file` | Read a text file at `path` under an already-cloned `repo_dir` | Whole-file only, UTF-8 text only. |
 | `write_file` | Overwrite (or create) a text file at `path` under `repo_dir` with the given content | Whole-file only — read, edit in full, write back. The one Phase 5 (remediation) needs on Claude Desktop, which has no file-editing tool of its own — confirmed in practice: without this, a Desktop-driven run got as far as creating the hotfix branch and then had no way to actually write the fix. |
 
@@ -93,6 +96,11 @@ set for another MCP server) pointing at your proxy's root CA cert. Without it, b
 outright with `SSLCertVerificationError` — confirmed in practice, not a hypothetical — even with a
 correct `GITHUB_TOKEN`. The server builds a combined bundle (public CAs + that cert) and points
 `REQUESTS_CA_BUNDLE` at it automatically; no manual bundle-building needed.
+
+`post_slack_alert`/`log_incident` were both added and verified end-to-end (a real Slack post, a
+real incident-log insert followed by a manual cleanup delete) after a real Desktop-driven run
+correctly reported both as unavailable rather than fake having done them — the honest report is
+what surfaced this as a gap worth closing, not a guess.
 
 ## Safety model
 

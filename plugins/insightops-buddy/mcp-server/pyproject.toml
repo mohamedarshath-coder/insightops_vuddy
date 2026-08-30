@@ -15,4 +15,5 @@ dependencies = [
     "databricks-sdk>=0.30.0",
     "PyGithub>=2.0.0",
     "certifi",
+    "requests",
 ]

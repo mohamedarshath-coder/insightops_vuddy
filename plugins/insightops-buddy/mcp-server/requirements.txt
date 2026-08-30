@@ -16,3 +16,6 @@ databricks-sdk>=0.30.0
 
 # Only needed for create_pr/find_open_pr -- every git_* tool works without it.
 PyGithub>=2.0.0
+
+# Only needed for post_slack_alert -- every other tool works without it.
+requests
