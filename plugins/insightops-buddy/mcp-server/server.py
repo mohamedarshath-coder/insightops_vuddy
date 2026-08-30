@@ -649,25 +649,39 @@ def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "
             client = _databricks_client()
         except RuntimeError as exc:
             return {**empty, "error": str(exc)}
-        try:
-            best_match = None
-            for repo in client.repos.list():
-                repo_path = getattr(repo, "path", None)
-                if repo_path and source_path.startswith(repo_path.rstrip("/") + "/"):
-                    if best_match is None or len(repo_path) > len(best_match.path):
-                        best_match = repo
-        except DatabricksError as exc:
-            return {**empty, "error": f"could not list Databricks Repos: {exc}"}
 
-        if best_match:
-            repo_path = best_match.path.rstrip("/")
+        # Walk up from the full path to find the repo root, trying repos.get() at each
+        # level -- NOT client.repos.list() + prefix match. Confirmed in practice: repos.list()
+        # can lag well behind repos.create() (a repo that resolved instantly via
+        # workspace.get_status() + repos.get() still hadn't appeared in repos.list() after
+        # 5+ minutes), which would make a just-created/just-repointed Repo invisible to this
+        # tool for an unpredictable stretch. workspace.get_status() + repos.get() reflects a
+        # repo immediately, with no such lag observed.
+        found_repo = None
+        found_repo_path = None
+        parts = source_path.strip("/").split("/")
+        for i in range(len(parts), 1, -1):
+            candidate_path = "/" + "/".join(parts[:i])
+            try:
+                status = client.workspace.get_status(candidate_path)
+            except DatabricksError:
+                continue
+            try:
+                found_repo = client.repos.get(repo_id=status.object_id)
+                found_repo_path = candidate_path
+                break
+            except DatabricksError:
+                continue  # this directory level isn't a repo root -- keep walking up
+
+        if found_repo:
+            repo_path = found_repo_path.rstrip("/")
             return {
                 "source_path": source_path,
-                "repo_url": getattr(best_match, "url", None),
+                "repo_url": getattr(found_repo, "url", None),
                 "repo_path_in_workspace": repo_path,
                 "relative_path_in_repo": source_path[len(repo_path):].lstrip("/"),
-                "branch": getattr(best_match, "branch", None),
-                "provider": (str(getattr(best_match, "provider", "")) or None),
+                "branch": getattr(found_repo, "branch", None),
+                "provider": (str(getattr(found_repo, "provider", "")) or None),
                 "resolution_method": "databricks_repos",
                 "error": None,
             }
