@@ -435,6 +435,36 @@ to git — check which one before assuming `sync-repo` will work:**
   `VERIFICATION_FAILED` — report `Verified: skipped (re-run mechanism can't validate a pre-merge
   branch for this job)` and say why, rather than implying the fix itself is wrong.
 
+### ⛔ MERGE APPROVAL GATE — required before any of the above can verify against `main`
+
+This skill **never merges its own PR**, and there is deliberately no `merge_pr` tool anywhere in
+`opsbuddy-git-ops` on either client — this is not a gap to close. For a job matching the "known
+limitation" above (task code clones its own default branch, ignoring any pre-merge override —
+confirmed in practice to be this exact plugin's own `test_run` job), Gate 8.5 categorically cannot
+verify anything pre-merge: merging to `main` is the only way to make the fix visible to a re-run
+at all, which makes the merge decision itself the real gate, not a formality before one.
+
+Before merging, present a plain-language approval request — don't just say "should I merge?":
+```
+PR #<n> — <repo>
+- Branch: <hotfix branch> → <base>
+- Fixes: <one line per AFFECTED_FILE, plain-language what changed>
+- Mode A review: <verdict>, <n>/7
+- Jira: <TICKET-KEY>, incident logged, alert sent
+
+If you approve, I will:
+1. Merge PR #<n> into <base>.
+2. Trigger a real re-run of <job_name> (job <job_id>) -- this can write real production data.
+3. Report pass/fail on that real run before updating Jira/incident-log to reflect resolution.
+
+Do you approve?
+```
+Only merge on an explicit yes — not a general "go ahead" from earlier in the conversation, since
+that approved the *fix*, not necessarily an unattended merge+re-run of production. Merging itself
+may also be blocked by a client-side safety classifier independent of this skill (confirmed in
+practice, in Claude Code) — if so, stop and hand the merge link to the human rather than trying
+another tool to route around it; pick back up at the real re-run once they confirm it's merged.
+
 Real success → Phase 9. Genuine failure (dbt/job actually re-ran the fix and it still broke) →
 loop back to Phase 5 once (same bounded budget as Phase 8's retry). One-time `jobs.submit()` run
 with no `job_id` → skip this gate and note why.
