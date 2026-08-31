@@ -850,14 +850,29 @@ def find_open_pr(repo: str, search_text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _incident_summary_blocks(incident: dict) -> list:
+# Five checkpoints across the pipeline, each with its own header/emoji so a channel reads as a
+# clear timeline rather than one undifferentiated "update" repeated five times.
+_STAGE_HEADERS = {
+    "incident_detected": "\U0001f6a8 opsbuddy-fix -- incident detected",
+    "pr_opened": "\U0001f500 opsbuddy-fix -- PR opened (not yet merged)",
+    "pr_merged": "✅ opsbuddy-fix -- PR merged",
+    "verification_running": "⏳ opsbuddy-fix -- verifying fix (re-run in progress)",
+    "resolved": "\U0001f389 opsbuddy-fix -- incident resolved",
+}
+
+
+def _incident_summary_blocks(incident: dict, stage: str = "", message: str = "") -> list:
+    header_text = _STAGE_HEADERS.get(stage, "opsbuddy-fix incident summary")
     fields = [
         {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"} for key, value in incident.items()
     ]
-    return [
-        {"type": "header", "text": {"type": "plain_text", "text": "opsbuddy-fix incident summary"}},
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header_text}},
         {"type": "section", "fields": fields},
     ]
+    if message:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": message}})
+    return blocks
 
 
 @mcp.tool()
@@ -868,8 +883,22 @@ def post_slack_alert(
     pr_url: str = "",
     pr_review_verdict: str = "",
     execution_status: str = "",
+    stage: str = "",
+    message: str = "",
 ) -> dict:
-    """Send the standard opsbuddy-fix Phase 10 Slack incident summary via SLACK_WEBHOOK_URL.
+    """Send one opsbuddy-fix Slack checkpoint via SLACK_WEBHOOK_URL. Call this up to five times
+    per run, once per checkpoint -- each post is independent, there is no running thread/state:
+      stage="incident_detected"      -- right after Phase 3 files the Jira ticket. Put the plain-
+                                         English root cause / RCA summary in `message`.
+      stage="pr_opened"               -- Phase 7, PR opened but not yet merged. Put pr_url.
+      stage="pr_merged"                -- after the human approves the Merge Approval Gate.
+      stage="verification_running"    -- Gate 8.5, right before triggering the real re-run.
+      stage="resolved"                 -- Phase 10, final outcome (Phase 9's ticket-update fields).
+    `stage` only changes the header/emoji shown in Slack -- every other field behaves exactly as
+    before, and `stage=""` still sends the original generic "incident summary" header, so existing
+    callers that don't pass it keep working unchanged. `message` is free text (e.g. the RCA
+    paragraph or a one-line verification result) shown as its own block below the field grid --
+    there was previously nowhere to put prose like that.
     Mirrors workflow/slack_workflow.py's send-incident-summary exactly (same fields, same block
     layout) so the message looks identical regardless of which client sent it."""
     if not SLACK_WEBHOOK_URL:
@@ -887,13 +916,13 @@ def post_slack_alert(
         "Review Verdict": pr_review_verdict,
         "Execution Status": execution_status,
     }
-    text = f"[opsbuddy-fix] {jira_ticket_id or databricks_run_id} -- {execution_status or 'update'}"
+    text = f"[opsbuddy-fix] {jira_ticket_id or databricks_run_id} -- {stage or execution_status or 'update'}"
     import requests
 
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
-            json={"text": text, "blocks": _incident_summary_blocks(incident)},
+            json={"text": text, "blocks": _incident_summary_blocks(incident, stage=stage, message=message)},
             timeout=10,
         )
     except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict

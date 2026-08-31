@@ -2,23 +2,29 @@
 name: opsbuddy-fix
 description: >-
   Autonomous, end-to-end incident response for a failed Databricks production job run, across 11
-  phases: fetch job telemetry, classify the error into one of 11 standardized categories via the
-  databricks-debug sub-skill and the root-cause-analysis (Cat L) agent, create a Jira ticket,
-  gate on whether a code fix is genuinely possible, resolve the actual backing GitHub repo, apply
-  and statically validate the fix (testing sub-skill), commit and push to GitHub, open a pull
-  request, run an automated PR review (pr-review-opsbuddy-fix, Mode A) against the confirmed
-  root cause, update the Jira ticket, send a Slack incident alert, log the incident to
-  Databricks, and print a final execution summary. Use whenever the user gives a Databricks job
-  run ID or job ID and asks to fix, resolve, or triage a failure end-to-end (e.g. "job 91004
-  failed, fix it", "run opsbuddy-fix on run 48213", "handle this Databricks incident"). For
-  read-only diagnosis with no fix/PR, use databricks-debug directly instead.
+  phases (plus a Confluence documentation phase): fetch job telemetry, classify the error into
+  one of 11 standardized categories via the databricks-debug sub-skill and the
+  root-cause-analysis (Cat L) agent, create a Jira ticket and drive it through a full Kanban
+  lifecycle (To Do → In Progress → In Review → Done, not just creation), gate on whether a code
+  fix is genuinely possible, resolve the actual backing GitHub repo, apply and statically
+  validate the fix (testing sub-skill), commit and push to GitHub, open a pull request, run an
+  automated PR review (pr-review-opsbuddy-fix, Mode A) against the confirmed root cause, post
+  five distinct Slack checkpoints across the run (incident detected + RCA, PR opened
+  unmerged, PR merged, verification running, resolved) so a channel reads as a timeline rather
+  than one final message, update the Jira ticket, log the incident to Databricks, publish an
+  incident postmortem Confluence page, and print a final execution summary. Use whenever the
+  user gives a Databricks job run ID or job ID and asks to fix, resolve, or triage a failure
+  end-to-end (e.g. "job 91004 failed, fix it", "run opsbuddy-fix on run 48213", "handle this
+  Databricks incident"). For read-only diagnosis with no fix/PR, use databricks-debug directly
+  instead.
 ---
 
-# opsbuddy-fix — Autonomous Pipeline Failure Monitoring & Fix (11 Phases)
+# opsbuddy-fix — Autonomous Pipeline Failure Monitoring & Fix (11 Phases + Confluence)
 
-Takes a failed Databricks job run from "it broke" to "here's a reviewed, merged-ready PR and a
-logged incident" — maintaining a live checklist across 11 phases. A human still makes the merge
-decision; this skill never merges its own PR.
+Takes a failed Databricks job run from "it broke" to "here's a reviewed, merged-ready PR, a
+Jira ticket carried through its full Kanban lifecycle, a timeline of Slack updates, and a
+published postmortem page" — maintaining a live checklist across 11 phases plus a Confluence
+documentation phase. A human still makes the merge decision; this skill never merges its own PR.
 
 **This plugin bundles its own copies of `workflow/*.py`, `python/utils/*.py`, and its own MCP
 server** (under `${CLAUDE_PLUGIN_ROOT}`) — installed via this marketplace, its `opsbuddy-git-ops`
@@ -52,9 +58,20 @@ fails/times out — never block the run on an MCP server being present:
   same job.
 - The **Atlassian connector** (`mcp__claude_ai_Atlassian__*`) — `getVisibleJiraProjects`,
   `searchJiraIssuesUsingJql`, `createJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`,
-  `getJiraProjectIssueTypesMetadata`. Every call needs `cloudId` — resolve it **once** per run via
+  `getTransitionsForJiraIssue`, `getJiraProjectIssueTypesMetadata`, and (for Phase 10.5)
+  `createConfluencePage`/`updateConfluencePage`/`getPagesInConfluenceSpace`. Every call needs
+  `cloudId` — resolve it **once** per run via
   `mcp__claude_ai_Atlassian__getAccessibleAtlassianResources` (or try the site hostname, e.g.
-  `yourorg.atlassian.net`, directly as `cloudId` first) and reuse it for every Jira call below.
+  `yourorg.atlassian.net`, directly as `cloudId` first) and reuse it for every Jira/Confluence
+  call below. **Always call `getTransitionsForJiraIssue` immediately before any
+  `transitionJiraIssue`** — the transition names on a real Kanban board (e.g. "Start Progress" vs.
+  "In Progress", or a custom "Done" variant) vary per project, exactly like the issue-type
+  fallback already does for `createJiraIssue`; match by substring against what comes back rather
+  than hardcoding a name, and if nothing matches, say so in the ticket comment and move on rather
+  than blocking the whole run on a Kanban-column naming mismatch.
+  Bash fallback for Confluence: `workflow/confluence_workflow.py upsert-page` (this plugin's own
+  script, new this revision — no MCP-vs-Bash gap here since the Atlassian connector's Confluence
+  tools and this script hit the same REST API).
 - A **generic Slack MCP server** (e.g. `@modelcontextprotocol/server-slack`, if registered) —
   `slack_post_message`. Lower priority than this plugin's own `post_slack_alert` above: this one's
   exact tool name/args aren't verified against your installed server in this session, and it needs
@@ -110,37 +127,51 @@ PHASE 2 — DIAGNOSE
 
 PHASE 3 — TICKET
   [ ] 3.  Check for an existing open incident ticket for this run (dedup)
-  [ ] 4.  Create Jira ticket (skipped if step 3 found one)
-  [ ] 5.  ⛔ GATE 3.5 (automated): Feasibility — CODE_FIX_POSSIBLE
+  [ ] 4.  Create Jira ticket (skipped if step 3 found one) — Kanban column: To Do
+  [ ] 5.  Transition Jira ticket -> In Progress (Kanban: work has started)
+  [ ] 6.  📢 Slack alert 1/5 — incident detected (RCA summary)
+  [ ] 7.  ⛔ GATE 3.5 (automated): Feasibility — CODE_FIX_POSSIBLE
 
 PHASE 4 — GIT SETUP
-  [ ] 6.  Resolve the backing repo (get-repo-mapping), dedup open PRs, clone +
+  [ ] 8.  Resolve the backing repo (get-repo-mapping), dedup open PRs, clone +
           create isolated hotfix branch
 
 PHASE 5 — REMEDIATION
-  [ ] 7.  Apply code fix
-  [ ] 8.  Static validation (testing sub-skill)
+  [ ] 9.  Apply code fix
+  [ ] 10. Static validation (testing sub-skill)
 
 PHASE 6 — COMMIT & PUSH
-  [ ] 9.  Commit (standard message convention) + push to GitHub
+  [ ] 11. Commit (standard message convention) + push to GitHub
 
 PHASE 7 — PULL REQUEST
-  [ ] 10. Open PR linking hotfix branch → target deployment branch
+  [ ] 12. Open PR linking hotfix branch → target deployment branch
+  [ ] 13. Transition Jira ticket -> In Review (Kanban: awaiting review/merge)
+  [ ] 14. 📢 Slack alert 2/5 — PR opened, not yet merged
 
 PHASE 8 — REVIEW
-  [ ] 11. Automated PR review (pr-review-opsbuddy-fix, Mode A) vs. root cause
-  [ ] 12. ⛔ GATE 8.5 (automated/human): Verify fix against a real re-run
+  [ ] 15. Automated PR review (pr-review-opsbuddy-fix, Mode A) vs. root cause
+  [ ] 16. ⛔ MERGE APPROVAL GATE (human): approve + confirm merge
+  [ ] 17. 📢 Slack alert 3/5 — PR merged
+  [ ] 18. 📢 Slack alert 4/5 — verification running (real re-run triggered)
+  [ ] 19. ⛔ GATE 8.5 (automated/human): Verify fix against a real re-run
+          (alerts 3 and 4 above can fire in either order — see Gate 8.5: a job that can verify
+          pre-merge via a Repos/git_source branch swap runs 18 before 16/17; a job that can only
+          be verified by merging to main runs 16/17 first)
 
 PHASE 9 — TICKET UPDATE
-  [ ] 13. Update Jira ticket (PR link, review verdict, execution status)
+  [ ] 20. Update Jira ticket (PR link, review verdict, execution status)
+  [ ] 21. Transition Jira ticket -> Done (Kanban: only once genuinely resolved)
 
 PHASE 10 — ALERTING & ERROR LOGGING
-  [ ] 14. Send Slack incident alert
-  [ ] 15. Write incident row to Databricks error log table
+  [ ] 22. 📢 Slack alert 5/5 — resolved (final summary)
+  [ ] 23. Write incident row to Databricks error log table
+
+PHASE 10.5 — CONFLUENCE DOCUMENTATION
+  [ ] 24. Create/update the incident postmortem Confluence page
 
 PHASE 11 — SUMMARY
-  [ ] 16. Clean up local working clone
-  [ ] 17. Print final execution summary
+  [ ] 25. Clean up local working clone
+  [ ] 26. Print final execution summary
 ```
 
 ---
@@ -234,7 +265,39 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py create --project <project
 Bug > Task > Story — if the requested type doesn't exist.) Populate with job/run ID, error
 category, root cause summary, stack trace excerpt, affected files, and — if Phase 2 found a
 second, unfixable bug — a plain note describing it as a follow-up needing a human decision.
-Capture the ticket key — used in every later branch name, commit, comment.
+Capture the ticket key — used in every later branch name, commit, comment. A freshly created
+ticket sits in its project's initial Kanban column (typically "To Do"/"Open") — that's fine as-is,
+no transition needed yet.
+
+**Move it into the Kanban "doing" column now that automated remediation is actually starting:**
+```
+# MCP-preferred (Atlassian connector) -- fetch the real transitions first, this board's exact
+# name for the "in progress" column isn't guaranteed (confirmed pattern elsewhere in this skill:
+# same reasoning as the issue-type fallback above)
+mcp__claude_ai_Atlassian__getTransitionsForJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>")
+mcp__claude_ai_Atlassian__transitionJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>",
+  transitionId="<id of whichever returned transition name matches 'in progress'/'doing'/'start'>")
+
+# Bash fallback (matches by name against the real available transitions, raises with the full
+# list if nothing matches -- never hardcodes a transition name blind)
+python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "In Progress"
+```
+
+**Slack alert 1/5 — incident detected.** This is the one checkpoint that carries prose, not just
+fields: put the plain-English root cause (from Phase 2's reconciled verdict) in `message` so the
+channel sees *what actually broke*, not just a category label.
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
+  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
+  execution_status="IN_PROGRESS", stage="incident_detected",
+  message="<ROOT_CAUSE_SUMMARY from Phase 2, 2-4 plain-English sentences>")
+
+# Bash fallback
+python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
+  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --status IN_PROGRESS \
+  --stage incident_detected --message "<ROOT_CAUSE_SUMMARY from Phase 2>"
+```
 
 ### ⛔ GATE 3.5 — Feasibility (automated)
 
@@ -386,10 +449,37 @@ cd <repo_dir> && python ${CLAUDE_PLUGIN_ROOT}/workflow/git_workflow.py create-pr
   --branch <TICKET-KEY>/hotfix-<slug> --jira-id <TICKET-KEY> \
   --repo <owner/repo resolved in Phase 4> --base <branch resolved in Phase 4>
 ```
-Capture the PR URL and number. **If you used the MCP path**, also transition the Jira ticket
-(e.g. to "In Review") and comment the PR link — the Bash fallback does this automatically as
-part of `create-pr`, but `create_pr` deliberately doesn't touch Jira at all, so it's your
-responsibility to do it explicitly when using that path.
+Capture the PR URL and number. **If you used the MCP path**, `create_pr` deliberately doesn't
+touch Jira at all (the Bash fallback's `create-pr` does this automatically as a side effect), so
+do the following two steps explicitly yourself:
+```
+# MCP-preferred (Atlassian connector) -- same "fetch real transitions first" pattern as Phase 3
+mcp__claude_ai_Atlassian__getTransitionsForJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>")
+mcp__claude_ai_Atlassian__transitionJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>",
+  transitionId="<id of whichever returned transition name matches 'review'>")
+mcp__claude_ai_Atlassian__addCommentToJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>",
+  commentBody="opsbuddy-fix: PR opened, awaiting review/merge. PR: <pr_url>")
+
+# Bash fallback (only needed if you used the MCP create_pr path above -- git_workflow.py's own
+# create-pr already did both of these for you)
+python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "In Review"
+python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment-rich <TICKET-KEY> \
+  "opsbuddy-fix: PR opened, awaiting review/merge." --link pr=<pr_url>
+```
+
+**Slack alert 2/5 — PR opened, not yet merged.** Send this regardless of which PR-creation path
+you used — neither path sends Slack on its own.
+```
+# MCP-preferred
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
+  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
+  pr_url="<pr_url>", execution_status="IN_REVIEW", stage="pr_opened")
+
+# Bash fallback
+python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
+  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
+  --status IN_REVIEW --stage pr_opened
+```
 
 ## Phase 8 — Automated PR Review
 
@@ -406,6 +496,23 @@ A Mode A `PASS` is a code review, not proof the job runs now. Re-running a real 
 real production data from unmerged code, so this is gated on `OPSBUDDY_VERIFY_ALLOWLIST` /
 explicit human approval either way. **The actual re-run mechanism depends on how the job links
 to git — check which one before assuming `sync-repo` will work:**
+
+**Slack alert 4/5 — verification running.** Send this immediately before triggering the real
+re-run below, whichever mechanism applies — the channel should see "we're about to run this for
+real" before the run itself starts, not only the eventual pass/fail:
+```
+# MCP-preferred
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
+  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
+  pr_url="<pr_url>", execution_status="VERIFYING", stage="verification_running",
+  message="Triggering a real re-run of <job_name> (job <job_id>) to verify the fix.")
+
+# Bash fallback
+python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
+  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
+  --status VERIFYING --stage verification_running \
+  --message "Triggering a real re-run of <job_name> (job <job_id>) to verify the fix."
+```
 
 - **Databricks Repos checkout** (`source_path` under `/Repos/...`) → the normal path:
   ```bash
@@ -475,6 +582,27 @@ may also be blocked by a client-side safety classifier independent of this skill
 practice, in Claude Code) — if so, stop and hand the merge link to the human rather than trying
 another tool to route around it; pick back up at the real re-run once they confirm it's merged.
 
+**Slack alert 3/5 — PR merged.** Send this the moment a merge is *confirmed* (don't send on the
+approval alone — a "yes" doesn't guarantee the merge itself succeeded, especially given the
+safety-classifier caveat above; verify the PR actually shows merged, e.g. via `find_open_pr`
+coming back empty or a direct merged-state check, before sending):
+```
+# MCP-preferred
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
+  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
+  pr_url="<pr_url>", execution_status="MERGED", stage="pr_merged")
+
+# Bash fallback
+python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
+  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
+  --status MERGED --stage pr_merged
+```
+Note the two mechanisms genuinely order alerts 3 and 4 differently, and that's correct, not a
+bug to reconcile: a job verifiable pre-merge (Databricks Repos checkout / job-level git_source)
+sends alert 4 first, verifies against the unmerged branch, and only reaches this merge gate
+afterward; a job matching the "must merge to verify" limitation reaches this gate first, so
+alert 3 fires before alert 4.
+
 Real success → Phase 9. Genuine failure (dbt/job actually re-ran the fix and it still broke) →
 loop back to Phase 5 once (same bounded budget as Phase 8's retry). One-time `jobs.submit()` run
 with no `job_id` → skip this gate and note why.
@@ -492,20 +620,47 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment-rich <TICKET-KEY>
   --link pr=<pr_url>
 ```
 
+**Close the Kanban loop — transition to Done, but only if `EXECUTION_STATUS` genuinely reflects a
+verified resolution** (Gate 8.5 reported real success, or it was legitimately skipped as a
+one-time run — never transition to Done off a bare Mode A `PASS` alone, since that's a code
+review, not proof the fix runs):
+```
+# MCP-preferred (Atlassian connector) -- same "fetch real transitions first" pattern as Phase 3/7
+mcp__claude_ai_Atlassian__getTransitionsForJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>")
+mcp__claude_ai_Atlassian__transitionJiraIssue(cloudId="<cloudId>", issueIdOrKey="<TICKET-KEY>",
+  transitionId="<id of whichever returned transition name matches 'done'/'closed'/'resolved'>")
+
+# Bash fallback
+python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "Done"
+```
+If `EXECUTION_STATUS` is anything other than a verified resolution (`MANUAL_ACTION_REQUIRED`,
+`REVIEW_FAILED`, `VERIFICATION_FAILED`, `REMEDIATION_FAILED`), **don't** transition to Done —
+leave the ticket at whatever Kanban column it's already in (In Progress/In Review) so a human
+sees it as still open, and say so plainly in the final report.
+
 ## Phase 10 — Alerting & Error Logging
 
+**Slack alert 5/5 — resolved (final summary).** This is the last of the five checkpoints, not the
+only one — by this point the channel has already seen alerts 1-4, so `message` here should be the
+one-line verification result (what Gate 8.5 actually found), not a repeat of the RCA from alert 1:
 ```
 # MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via a pre-configured incoming
 # webhook, same as the Bash path; needs no channel ID unlike a generic Slack MCP server would)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
   jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>", execution_status="<EXECUTION_STATUS>")
+  pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>", execution_status="<EXECUTION_STATUS>",
+  stage="resolved", message="<one-line Gate 8.5 verification result, or why it was skipped>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
   --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
-  --pr-url <pr_url> --verdict <mode-a-verdict> --status <EXECUTION_STATUS>
+  --pr-url <pr_url> --verdict <mode-a-verdict> --status <EXECUTION_STATUS> \
+  --stage resolved --message "<one-line Gate 8.5 verification result, or why it was skipped>"
 ```
+If the run halted before reaching a terminal state (Gate 3.5/Phase 5/Phase 8/Gate 8.5), this is
+still the right call to make — just with `EXECUTION_STATUS` set to whichever halt status applies
+(`MANUAL_ACTION_REQUIRED`/`REMEDIATION_FAILED`/`REVIEW_FAILED`/`VERIFICATION_FAILED`) so the
+channel's timeline ends with an honest outcome rather than silently stopping at alert 3 or 4.
 The Databricks incident-log write now has a real MCP path too — this closed Desktop's last
 Phase-10 gap (confirmed in practice: a Desktop-driven run correctly reported this step as
 unavailable, since only a Bash fallback existed before):
@@ -555,6 +710,36 @@ Slack-native, update this block to match — don't silently drift back to guesse
 If `SLACK_WEBHOOK_URL`/a Slack MCP server, or the Databricks incident-log table isn't configured,
 note that plainly in the final report rather than treating it as a silent no-op or a hard failure.
 
+## Phase 10.5 — Confluence Documentation
+
+Publish one incident postmortem page per run — this is the artifact a human re-reads later or
+pastes into a broader report, distinct from the Jira ticket (workflow tracking) and the Slack
+alerts (point-in-time notifications). Idempotent by title, so re-running this phase (e.g. after
+Gate 8.5 finally resolves following a halt) safely updates the same page rather than creating a
+duplicate:
+```
+# MCP-preferred (Atlassian connector)
+mcp__claude_ai_Atlassian__getPagesInConfluenceSpace(cloudId="<cloudId>", spaceId="<space>",
+  title="<TICKET-KEY>: <job_name> incident")
+# → if found, mcp__claude_ai_Atlassian__updateConfluencePage(...) with the existing pageId;
+#   otherwise mcp__claude_ai_Atlassian__createConfluencePage(cloudId="<cloudId>", spaceId="<space>",
+#   title="<TICKET-KEY>: <job_name> incident", body="<storage-format HTML, see Bash fallback's
+#   build_incident_page_html for the exact structure to mirror: metadata table, root cause,
+#   timeline, how-to-verify, related resources>")
+
+# Bash fallback (this plugin's own new script — builds the same structure, upsert-by-title)
+python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
+  --space <CONFLUENCE_SPACE_KEY, default OOP> --title "<TICKET-KEY>: <job_name> incident" \
+  --jira-id <TICKET-KEY> --job-name "<job_name>" --run-id $ARGUMENTS --job-id <job_id> \
+  --category "<ERROR_CATEGORY>" --rca "<ROOT_CAUSE_SUMMARY>" --repo "<owner/repo>" \
+  --branch "<hotfix branch>" --pr-url <pr_url> --verdict "<mode-a-verdict>" \
+  --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS>
+```
+Capture the page URL for Phase 11's summary. If neither the Atlassian connector's Confluence
+tools nor `CONFLUENCE_BASE_URL`/`CONFLUENCE_EMAIL`/`CONFLUENCE_API_TOKEN` are configured, note
+that plainly in the final report — same treatment as a missing `SLACK_WEBHOOK_URL` in Phase 10,
+not a silent skip and not a hard failure of the whole run.
+
 ## Phase 11 — Summary
 
 Clean up the isolated clone: `rm -rf <repo_dir>` in Bash mode. `opsbuddy-git-ops` exposes no
@@ -571,10 +756,15 @@ leaving it unaddressed, and clean it up manually/periodically outside this skill
   Review       : <PASS/FAIL>
   Verified     : <PASS/FAIL/skipped (one-time run)/skipped (not approved)/skipped (mechanism
                  can't validate this job)>
-  Jira         : <status>
-  Slack sent   : <yes/no>
+  Jira         : <TICKET-KEY> -- <final Kanban column, e.g. Done, or In Progress/In Review if
+                 halted before a verified resolution>
+  Slack alerts : <n>/5 sent (1 detected, 2 pr_opened, 3 pr_merged, 4 verifying, 5 resolved --
+                 list any of the 5 that never fired and why, e.g. "3/4 skipped: halted at Gate 3.5")
   Databricks row: <incident_id/skipped>
+  Confluence   : <page_url/skipped (reason)>
 ══════════════════════════════════════
 ```
 If the run halted at Gate 3.5, Phase 5, Phase 8, or Gate 8.5, state clearly which phase it
-stopped at and what manual action is now required.
+stopped at and what manual action is now required — and that Slack alert 5/5 and Phase 10.5's
+Confluence page still fire even on a halt (reporting the halt itself), while the Jira ticket
+correctly stays off "Done" per Phase 9's rule above.

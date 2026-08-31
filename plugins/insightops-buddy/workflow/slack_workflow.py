@@ -39,18 +39,30 @@ class SlackClient:
         logger.info(f"Sent Slack message: {text}")
 
 
-def build_incident_summary_blocks(incident: dict) -> list:
+# Five checkpoints across the pipeline -- see cmd_send_incident_summary's --stage help for when
+# each fires. Kept in sync with mcp-server/server.py's _STAGE_HEADERS (same dict, same keys).
+STAGE_HEADERS = {
+    "incident_detected": "\U0001f6a8 opsbuddy-fix -- incident detected",
+    "pr_opened": "\U0001f500 opsbuddy-fix -- PR opened (not yet merged)",
+    "pr_merged": "✅ opsbuddy-fix -- PR merged",
+    "verification_running": "⏳ opsbuddy-fix -- verifying fix (re-run in progress)",
+    "resolved": "\U0001f389 opsbuddy-fix -- incident resolved",
+}
+
+
+def build_incident_summary_blocks(incident: dict, stage: str = "", message: str = "") -> list:
+    header_text = STAGE_HEADERS.get(stage, "opsbuddy-fix incident summary")
     fields = [
         {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"}
         for key, value in incident.items()
     ]
-    return [
-        {
-            "type": "header",
-            "text": {"type": "plain_text", "text": "opsbuddy-fix incident summary"},
-        },
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": header_text}},
         {"type": "section", "fields": fields},
     ]
+    if message:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": message}})
+    return blocks
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -78,6 +90,21 @@ def cmd_send(text: str):
 @click.option("--pr-url", default="")
 @click.option("--verdict", default="")
 @click.option("--status", "execution_status", default="")
+@click.option(
+    "--stage",
+    default="",
+    type=click.Choice(
+        ["", "incident_detected", "pr_opened", "pr_merged", "verification_running", "resolved"]
+    ),
+    help=(
+        "Which pipeline checkpoint this post is for -- controls the header/emoji only. "
+        "incident_detected=Phase 3 (ticket filed; put RCA in --message), pr_opened=Phase 7 "
+        "(not yet merged), pr_merged=after the Merge Approval Gate, "
+        "verification_running=Gate 8.5 (right before the real re-run), resolved=Phase 10 final "
+        "outcome. Omit for the original undifferentiated 'incident summary' header."
+    ),
+)
+@click.option("--message", default="", help="Free-text prose (e.g. RCA summary, verification result)")
 def cmd_send_incident_summary(
     jira_id: str,
     run_id: str,
@@ -85,8 +112,10 @@ def cmd_send_incident_summary(
     pr_url: str,
     verdict: str,
     execution_status: str,
+    stage: str,
+    message: str,
 ):
-    """Send the standard opsbuddy-fix Phase 10 Slack incident summary."""
+    """Send one opsbuddy-fix incident checkpoint. Call up to five times per run (--stage)."""
     incident = {
         "Jira Ticket": jira_id,
         "Databricks Run ID": run_id,
@@ -95,8 +124,8 @@ def cmd_send_incident_summary(
         "Review Verdict": verdict,
         "Execution Status": execution_status,
     }
-    blocks = build_incident_summary_blocks(incident)
-    text = f"[opsbuddy-fix] {jira_id or run_id} — {execution_status or 'update'}"
+    blocks = build_incident_summary_blocks(incident, stage=stage, message=message)
+    text = f"[opsbuddy-fix] {jira_id or run_id} — {stage or execution_status or 'update'}"
     SlackClient().send_message(text=text, blocks=blocks)
     click.echo("[OK] Incident summary sent to Slack")
 

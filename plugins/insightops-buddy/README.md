@@ -13,14 +13,21 @@ automatically:
    two independent AI passes so one bad guess can't push a wrong fix.
 2. **Decides if it's actually fixable in code** — if it's an infra/data problem instead, it stops
    and flags it for a human rather than forcing a fake fix.
-3. **Files a Jira ticket** for the incident (with dedup — won't double-file for the same run).
+3. **Files a Jira ticket** for the incident (with dedup — won't double-file for the same run) and
+   drives it through a real Kanban lifecycle — **To Do → In Progress → In Review → Done** — not
+   just a single creation call, so the board always reflects where the fix actually stands.
 4. **Writes the fix, opens a PR** on GitHub (with dedup — reuses an existing open PR if one
    already covers this run).
 5. **Reviews its own fix** against the confirmed root cause before anyone else looks at it.
 6. **Optionally re-runs the job for real** to prove the fix actually works — only for jobs
    explicitly allow-listed for auto-verification, or with a person's explicit approval, and only
    when the job's git-linkage actually supports pointing it at an unmerged branch.
-7. **Posts a Slack alert** and logs the incident to a Databricks table.
+7. **Posts five Slack checkpoints across the run**, not one final message — incident detected
+   (with the plain-English root cause), PR opened (not yet merged), PR merged, verification
+   running, and resolved — so a channel reads as a timeline of what's happening, not a single
+   "done" ping at the end.
+8. **Logs the incident to a Databricks table and publishes an incident postmortem page to
+   Confluence** — idempotent by title, so re-runs update the same page rather than duplicating it.
 
 A person still reviews and merges the PR — this plugin never merges anything on its own.
 
@@ -45,6 +52,13 @@ your real project key if your Jira instance doesn't have one), `DATABRICKS_OPS_I
 `OPSBUDDY_VERIFY_ALLOWLIST` (comma-separated job IDs, or `all`, gating Gate 8.5's real job
 re-run), `OPSBUDDY_MCP_WORKDIR` (the bundled MCP server's sandboxed clone directory).
 
+**Confluence (Phase 10.5), all optional:** `CONFLUENCE_BASE_URL` (defaults to
+`<JIRA_BASE_URL>/wiki` — Confluence Cloud's standard path on the same Atlassian site, so usually
+nothing to set), `CONFLUENCE_EMAIL`/`CONFLUENCE_API_TOKEN` (default to `JIRA_EMAIL`/
+`JIRA_API_TOKEN` — one Atlassian API token normally covers both Jira and Confluence on the same
+account), `CONFLUENCE_SPACE_KEY` (default `OOP`), `CONFLUENCE_AUTHOR` (default `opsbuddy-fix`,
+shown on the published page).
+
 ## Structure
 
 ```
@@ -52,12 +66,12 @@ insightops-buddy/
 ├── .claude-plugin/plugin.json      # plugin manifest
 ├── .mcp.json                       # declares the bundled opsbuddy-git-ops MCP server
 ├── skills/
-│   ├── opsbuddy-fix/SKILL.md       # the 11-phase orchestrator
+│   ├── opsbuddy-fix/SKILL.md       # the 11-phase orchestrator + Phase 10.5 Confluence
 │   ├── databricks-debug/SKILL.md   # telemetry + 11-category classification sub-skill
 │   ├── testing/SKILL.md            # static validation sub-skill
 │   └── pr-review-opsbuddy-fix/SKILL.md   # Mode A automated PR review
 ├── agents/root-cause-analysis.md   # Cat L root-cause subagent
-├── workflow/                       # bundled CLI scripts (databricks/jira/git/slack)
+├── workflow/                       # bundled CLI scripts (databricks/jira/git/slack/confluence)
 ├── python/utils/                   # bundled shared helpers (config, logger, databricks_conn)
 └── mcp-server/                     # bundled MCP server (git ops + static validation) — see its README
 ```
