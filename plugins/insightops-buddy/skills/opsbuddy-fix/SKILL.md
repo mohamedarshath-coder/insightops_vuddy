@@ -1,22 +1,15 @@
 ---
 name: opsbuddy-fix
 description: >-
-  Autonomous, end-to-end incident response for a failed Databricks production job run, across 11
-  phases (plus a Confluence documentation phase): fetch job telemetry, classify the error into
-  one of 11 standardized categories via the databricks-debug sub-skill and the
-  root-cause-analysis (Cat L) agent, create a Jira ticket and drive it through a full Kanban
-  lifecycle (To Do → In Progress → In Review → Done, not just creation), gate on whether a code
-  fix is genuinely possible, resolve the actual backing GitHub repo, apply and statically
-  validate the fix (testing sub-skill), commit and push to GitHub, open a pull request, run an
-  automated PR review (pr-review-opsbuddy-fix, Mode A) against the confirmed root cause, post
-  five distinct Slack checkpoints across the run (incident detected + RCA, PR opened
-  unmerged, PR merged, verification running, resolved) so a channel reads as a timeline rather
-  than one final message, update the Jira ticket, log the incident to Databricks, publish an
-  incident postmortem Confluence page, and print a final execution summary. Use whenever the
-  user gives a Databricks job run ID or job ID and asks to fix, resolve, or triage a failure
-  end-to-end (e.g. "job 91004 failed, fix it", "run opsbuddy-fix on run 48213", "handle this
-  Databricks incident"). For read-only diagnosis with no fix/PR, use databricks-debug directly
-  instead.
+  Autonomous, end-to-end incident response for a failed Databricks production job run: fetch
+  telemetry, classify via databricks-debug + the root-cause-analysis (Cat L) agent, file a Jira
+  ticket and carry it through a full Kanban lifecycle (To Do -> In Progress -> In Review -> Done),
+  gate on whether a code fix is possible, resolve the backing repo, apply and validate the fix,
+  open a PR, run an automated Mode A review, post a 5-stage Slack timeline (detected, PR opened,
+  merged, verifying, resolved), update Jira, log the incident, and publish a Confluence
+  postmortem page. Use whenever given a Databricks job run ID or job ID and asked to fix,
+  resolve, or triage a failure end-to-end (e.g. "job 91004 failed, fix it", "run opsbuddy-fix on
+  run 48213"). For read-only diagnosis with no fix/PR, use databricks-debug instead.
 ---
 
 # opsbuddy-fix — Autonomous Pipeline Failure Monitoring & Fix (11 Phases + Confluence)
