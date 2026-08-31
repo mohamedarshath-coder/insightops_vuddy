@@ -9,7 +9,7 @@ how it's put together.
 
 ```
 /plugin marketplace add mohamedarshath-coder/insightops_vuddy
-/plugin install insightops-buddy@insightops-vuddy
+/plugin install insightops-buddy@insightops-vuddy2
 ```
 
 Then complete the one-time MCP server setup described in

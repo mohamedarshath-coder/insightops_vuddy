@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "insightops-vuddy",
-  "version": "1.0.0",
+  "name": "insightops-vuddy2",
+  "version": "1.1.0",
   "description": "Marketplace for the insightops-buddy plugin: autonomous end-to-end incident response for failed Databricks production job runs.",
   "owner": {
     "name": "mohamedarshath-coder"

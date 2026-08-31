@@ -35,7 +35,7 @@ A person still reviews and merges the PR — this plugin never merges anything o
 
 ```
 /plugin marketplace add mohamedarshath-coder/insightops_vuddy
-/plugin install insightops-buddy@insightops-vuddy
+/plugin install insightops-buddy@insightops-vuddy2
 ```
 
 Then run the one-time MCP server setup in `mcp-server/README.md` (create its venv, `pip install

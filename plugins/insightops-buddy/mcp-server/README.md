@@ -59,7 +59,7 @@ it. Ctrl-C to stop. If `git` isn't on PATH you'll get a `FATAL:` message instead
 ## 4. Installed via the marketplace? Registration is automatic
 
 This plugin's `.mcp.json` (at `plugins/insightops-buddy/.mcp.json` in this repo) already declares
-`opsbuddy-git-ops` — once the plugin is installed (`/plugin install insightops-buddy@insightops-vuddy`),
+`opsbuddy-git-ops` — once the plugin is installed (`/plugin install insightops-buddy@insightops-vuddy2`),
 Claude Code starts this server itself; there's nothing to add to `claude_desktop_config.json`
 manually. Confirm with `/mcp` that `opsbuddy-git-ops` is connected and its 17 tools are listed:
 `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`, `run_static_checks`,
