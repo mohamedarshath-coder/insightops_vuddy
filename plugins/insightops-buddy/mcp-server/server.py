@@ -29,13 +29,16 @@ Tools:
     trigger_job_run(job_id, timeout_seconds=600, force=False)
     get_table_lineage(run_id)
 
-get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, and what
-else downstream reads those same tables) -- distinct from get_job_run's "downstream impact",
-which only ever looks at task state inside one job's own DAG, not tables. This plugin had no data
-lineage capability at all until this tool was added; the only prior source of it
-(databricks-job-lineage's own get_table_lineage) lived in a plugin this one was deliberately built
-not to depend on. Needs DATABRICKS_SQL_WAREHOUSE_ID (same var log_incident already uses) plus
-Unity Catalog lineage tracking enabled on the workspace -- see get_table_lineage's own docstring.
+get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, one hop of
+upstream producers of what it read, and one hop of downstream consumers of what it wrote) --
+distinct from get_job_run's "downstream impact", which only ever looks at task state inside one
+job's own DAG, not tables. upstream_producers is what to check when the real root cause might be
+bad data from further back in the pipeline, not a bug in the job that's actually failing. This
+plugin had no data lineage capability at all until this tool was added; the only prior source of
+it (databricks-job-lineage's own get_table_lineage) lived in a plugin this one was deliberately
+built not to depend on, and that version was one-directional (downstream only). Needs
+DATABRICKS_SQL_WAREHOUSE_ID (same var log_incident already uses) plus Unity Catalog lineage
+tracking enabled on the workspace -- see get_table_lineage's own docstring.
 
 get_job_run/get_latest_failed_run/trigger_job_run close the last two Bash-only steps in the whole
 pipeline: Phase 1's telemetry fetch and Gate 8.5's real-verification re-run had no MCP path in
@@ -1369,13 +1372,25 @@ def get_table_lineage(run_id: str) -> dict:
     erroring, run `DESCRIBE system.access.table_lineage` in a SQL editor and adjust the queries
     below to match.
 
+    Also resolves one hop of lineage in **both** directions, not just downstream: `upstream_producers`
+    is whatever wrote the tables this run *read* (the thing to check if the real root cause is
+    bad data from further back in the pipeline, not this run's own code), symmetric to
+    `downstream_consumers` (whatever reads the tables this run *wrote*). Neither is transitive --
+    this is one hop each way, not a full DAG walk; call this again on an upstream producer's own
+    run_id if you need to go back further.
+
     Fails soft, same philosophy as every other tool here: returns an `error` field instead of
     raising when something's wrong (no warehouse configured, UC lineage not enabled, the query
     itself errors), and returns genuinely empty lists when there's honestly nothing there (the
     run never got far enough to read/write anything) -- don't let a caller mistake "couldn't
     check" for "there's nothing there."
     """
-    empty = {"tables_read": [], "tables_written": [], "downstream_consumers": []}
+    empty = {
+        "tables_read": [],
+        "tables_written": [],
+        "upstream_producers": [],
+        "downstream_consumers": [],
+    }
     if not DATABRICKS_SQL_WAREHOUSE_ID:
         return {
             **empty,
@@ -1415,34 +1430,58 @@ def get_table_lineage(run_id: str) -> dict:
     tables_read = sorted({r[0] for r in rows if r and r[0]})
     tables_written = sorted({r[1] for r in rows if r and r[1]})
 
-    downstream_consumers = []
-    if tables_written:
-        in_clause = ", ".join(f"'{t}'" for t in tables_written)
+    def neighbor_entities(tables, column):
+        """One hop of lineage neighbors touching `tables` via `column`
+        (source_table_full_name for consumers of what we wrote, target_table_full_name for
+        producers of what we read), excluding this run itself."""
+        if not tables:
+            return [], None
+        in_clause = ", ".join(f"'{t}'" for t in tables)
         try:
-            consumer_rows = run_query(
+            rows = run_query(
                 f"""
                 SELECT DISTINCT entity_type, entity_id
                 FROM system.access.table_lineage
-                WHERE source_table_full_name IN ({in_clause})
+                WHERE {column} IN ({in_clause})
                   AND entity_run_id != '{run_id}'
                 """
             )
         except DatabricksError as exc:
-            return {
-                "tables_read": tables_read,
-                "tables_written": tables_written,
-                "downstream_consumers": [],
-                "error": f"downstream consumer lookup failed (tables read/written above are still valid): {exc}",
+            return [], str(exc)
+        entities = [
+            {
+                "type": (entity_type or "unknown").lower(),
+                "name": _job_name(client, entity_id) if entity_type == "JOB" else str(entity_id),
+                "id": str(entity_id),
             }
-        for entity_type, entity_id in consumer_rows:
-            name = _job_name(client, entity_id) if entity_type == "JOB" else str(entity_id)
-            downstream_consumers.append(
-                {"type": (entity_type or "unknown").lower(), "name": name, "id": str(entity_id)}
-            )
+            for entity_type, entity_id in rows
+        ]
+        return entities, None
+
+    upstream_producers, upstream_error = neighbor_entities(tables_read, "target_table_full_name")
+    if upstream_error:
+        return {
+            "tables_read": tables_read,
+            "tables_written": tables_written,
+            "upstream_producers": [],
+            "downstream_consumers": [],
+            "error": f"upstream producer lookup failed (tables read/written above are still valid): {upstream_error}",
+        }
+
+    downstream_consumers, downstream_error = neighbor_entities(tables_written, "source_table_full_name")
+    if downstream_error:
+        return {
+            "tables_read": tables_read,
+            "tables_written": tables_written,
+            "upstream_producers": upstream_producers,
+            "downstream_consumers": [],
+            "error": f"downstream consumer lookup failed (everything else above is still valid): {downstream_error}",
+        }
 
     return {
         "tables_read": tables_read,
         "tables_written": tables_written,
+        "upstream_producers": upstream_producers,
         "downstream_consumers": downstream_consumers,
         "error": None,
     }

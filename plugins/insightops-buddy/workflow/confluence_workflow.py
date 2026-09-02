@@ -164,6 +164,7 @@ def build_incident_page_html(
     date: str = "",
     tables_read: str = "",
     tables_written: str = "",
+    upstream_producers: str = "",
     downstream_consumers: str = "",
 ) -> str:
     if not author:
@@ -197,7 +198,7 @@ def build_incident_page_html(
             return f"<p>{empty_label}</p>"
         return "<ul>" + "".join(f"<li><code>{i}</code></li>" for i in items) + "</ul>"
 
-    lineage_checked = bool(tables_read or tables_written or downstream_consumers)
+    lineage_checked = bool(tables_read or tables_written or upstream_producers or downstream_consumers)
     lineage_html = (
         f"""
 <h2>&#128472; Data Lineage</h2>
@@ -205,6 +206,8 @@ def build_incident_page_html(
 {lineage_field(tables_read, "None")}
 <h3>Tables written</h3>
 {lineage_field(tables_written, "None")}
+<h3>Upstream producers</h3>
+{lineage_field(upstream_producers, "None found")}
 <h3>Downstream consumers</h3>
 {lineage_field(downstream_consumers, "None found")}
 """
@@ -291,6 +294,7 @@ def cli():
 @click.option("--parent-id", default=None, help="Parent page ID")
 @click.option("--tables-read", default="", help="Comma-separated tables get_table_lineage found this run read, or 'unavailable' if that call errored/wasn't configured")
 @click.option("--tables-written", default="", help="Comma-separated tables get_table_lineage found this run wrote, or 'unavailable'")
+@click.option("--upstream-producers", default="", help="Comma-separated 'name (type)' entries from get_table_lineage's upstream_producers, or 'unavailable'")
 @click.option("--downstream-consumers", default="", help="Comma-separated 'name (type)' entries from get_table_lineage's downstream_consumers, or 'unavailable'")
 def cmd_upsert_page(
     space,
@@ -310,6 +314,7 @@ def cmd_upsert_page(
     parent_id,
     tables_read,
     tables_written,
+    upstream_producers,
     downstream_consumers,
 ):
     """Create or update the incident postmortem page for this run (idempotent by title)."""
@@ -329,6 +334,7 @@ def cmd_upsert_page(
         execution_status=execution_status,
         tables_read=tables_read,
         tables_written=tables_written,
+        upstream_producers=upstream_producers,
         downstream_consumers=downstream_consumers,
     )
     page = ConfluenceClient().upsert_page(space_key, title, body, parent_id)

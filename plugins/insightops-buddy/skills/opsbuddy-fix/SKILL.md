@@ -205,12 +205,18 @@ names come from telemetry.
 # MCP-preferred (this plugin's own opsbuddy-git-ops)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_table_lineage(run_id="$ARGUMENTS")
 ```
-Capture `tables_read`, `tables_written`, and `downstream_consumers` — this is the actual data
-blast radius (what else in the workspace reads the tables this run touched), distinct from and in
-addition to the task-level "Downstream impact" Phase 3's ticket already reports. This needs
-`DATABRICKS_SQL_WAREHOUSE_ID` and Unity Catalog lineage tracking enabled — **if it comes back
-with an `error` (not configured, UC lineage off, query failed), don't block or retry: note
-lineage as "unavailable" in Phase 3's ticket and move on.** This is enrichment, not a
+Capture `tables_read`, `tables_written`, `upstream_producers`, and `downstream_consumers` — this
+is the actual data blast radius, in both directions: `downstream_consumers` is what else in the
+workspace reads the tables this run touched (distinct from and in addition to the task-level
+"Downstream impact" Phase 3's ticket already reports); `upstream_producers` is what actually wrote
+the tables this run read. **If `upstream_producers` names a job that isn't the one this run
+belongs to, that's worth a plain note in the ticket** ("root cause may originate upstream in
+`<upstream job name>`, which produced `<table>`") — Phase 2's diagnosis still proceeds against
+*this* run's own code, this skill doesn't pivot to diagnosing or fixing a different job on its own
+initiative, but the human reading the ticket should see the lead rather than have to go find it
+themselves. This needs `DATABRICKS_SQL_WAREHOUSE_ID` and Unity Catalog lineage tracking enabled —
+**if it comes back with an `error` (not configured, UC lineage off, query failed), don't block or
+retry: note lineage as "unavailable" in Phase 3's ticket and move on.** This is enrichment, not a
 prerequisite — Phase 2's diagnosis and everything after it proceeds identically whether or not
 this call actually returns data.
 
@@ -288,7 +294,11 @@ Run page: <run_page_url>
 ### Data lineage
 Tables read: <tables_read, or "none">
 Tables written: <tables_written, or "none">
+Upstream producers: <upstream_producers -- name + type per line, or "none found">
 Downstream consumers: <downstream_consumers -- name + type per line, or "none found">
+(if upstream_producers names a job other than this one, add one line here: "Possible upstream
+root cause: <job name> produced <table>" -- a lead for the human, not a conclusion this skill
+draws on its own)
 (omit this whole section if Phase 1's get_table_lineage call errored or wasn't configured --
 say "unavailable" in one line instead of leaving it out silently, so a reader knows it was
 checked and just couldn't be retrieved, not that no one thought to check)
@@ -816,6 +826,7 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
   --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS> \
   --tables-read "<Phase 1's tables_read, comma-separated, or 'unavailable'>" \
   --tables-written "<Phase 1's tables_written, comma-separated, or 'unavailable'>" \
+  --upstream-producers "<Phase 1's upstream_producers, comma-separated 'name (type)', or 'unavailable'>" \
   --downstream-consumers "<Phase 1's downstream_consumers, comma-separated 'name (type)', or 'unavailable'>"
 ```
 Reuse Phase 1's `get_table_lineage` result here too — don't re-fetch it. Pass `"unavailable"`
