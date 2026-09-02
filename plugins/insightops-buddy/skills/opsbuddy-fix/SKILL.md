@@ -246,14 +246,49 @@ mcp__claude_ai_Atlassian__getJiraProjectIssueTypesMetadata(cloudId="<cloudId>", 
 mcp__claude_ai_Atlassian__createJiraIssue(cloudId="<cloudId>", projectKey="<project>",
   issueTypeName="<first available of Incident/Bug/Task/Story>",
   summary="[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>",
-  description="<run metadata + full diagnostics markdown>",
+  description="<run metadata + full diagnostics -- standard Markdown, see format note below>",
   additional_fields={"priority": {"name": "High"}, "labels": ["opsbuddy-fix"]})
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py create --project <project> --type Task \
   --summary "[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>" \
-  --description "<run metadata + full diagnostics markdown>" --priority High --label opsbuddy-fix
+  --description "<run metadata + full diagnostics -- standard Markdown>" --priority High --label opsbuddy-fix
 ```
+**Description format — standard Markdown only, never Jira wiki markup.** The Atlassian
+connector's `description` renders CommonMark Markdown (`##`/`###` headings, triple-backtick code
+fences, `**bold**`) and converts it to ADF itself — it does **not** render Jira/Confluence wiki
+markup (`h3.` headings, `{code}...{code}` blocks, `{quote}`). Confirmed in practice: a real run
+used wiki markup here and it came out as literal, unrendered text (`h3. Root cause` printed as a
+plain line, not a heading) — easy mistake since wiki markup is what a human typing directly into
+Jira's own editor would use, but this call doesn't go through that editor. Use exactly this shape:
+
+```markdown
+### Run details
+Job: <job_name> (job_id <job_id>)
+Run ID: <run_id>
+Failed task: <task_key> (<source_path>)
+Downstream impact: <tasks that went UPSTREAM_FAILED, or "none">
+Run page: <run_page_url>
+
+### Error
+```
+<the real error message, verbatim>
+```
+
+### Root cause
+ERROR_CATEGORY: <category>
+
+<the actual root-cause paragraph(s) from Phase 2>
+
+### Affected files
+<one path per line>
+
+### Suggested fix
+<the fix approach, in prose>
+
+CODE_FIX_POSSIBLE: <true/false> (<confidence note>)
+```
+
 (`create` automatically falls back to whatever issue type the project actually has — Incident >
 Bug > Task > Story — if the requested type doesn't exist.) Populate with job/run ID, error
 category, root cause summary, stack trace excerpt, affected files, and — if Phase 2 found a
