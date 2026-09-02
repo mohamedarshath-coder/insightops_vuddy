@@ -27,6 +27,15 @@ Tools:
     get_job_run(run_id)
     get_latest_failed_run(job_id)
     trigger_job_run(job_id, timeout_seconds=600, force=False)
+    get_table_lineage(run_id)
+
+get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, and what
+else downstream reads those same tables) -- distinct from get_job_run's "downstream impact",
+which only ever looks at task state inside one job's own DAG, not tables. This plugin had no data
+lineage capability at all until this tool was added; the only prior source of it
+(databricks-job-lineage's own get_table_lineage) lived in a plugin this one was deliberately built
+not to depend on. Needs DATABRICKS_SQL_WAREHOUSE_ID (same var log_incident already uses) plus
+Unity Catalog lineage tracking enabled on the workspace -- see get_table_lineage's own docstring.
 
 get_job_run/get_latest_failed_run/trigger_job_run close the last two Bash-only steps in the whole
 pipeline: Phase 1's telemetry fetch and Gate 8.5's real-verification re-run had no MCP path in
@@ -1323,6 +1332,119 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
         "run_id": run_id,
         "succeeded": None,
         "error": f"Run {run_id} did not finish within {timeout_seconds}s",
+    }
+
+
+# ---------------------------------------------------------------------------
+# 18. get_table_lineage
+# ---------------------------------------------------------------------------
+
+
+def _job_name(client, job_id) -> str:
+    """Best-effort job name lookup, for annotating a lineage consumer that's a job rather than a
+    bare ID -- never worth failing the whole lineage call over."""
+    try:
+        job = client.jobs.get(job_id=int(job_id))
+        return job.settings.name if job.settings and job.settings.name else f"job {job_id}"
+    except Exception:  # noqa: BLE001
+        return f"job {job_id}"
+
+
+@mcp.tool()
+def get_table_lineage(run_id: str) -> dict:
+    """Unity Catalog table lineage for a specific job run -- which tables the run's task(s) read
+    from and wrote to, plus anything downstream that reads from those same tables (the actual
+    blast radius of a bad run, not just "which tasks in this job failed" like get_job_run's
+    downstream-task info already covers). This is real data lineage, distinct from that --
+    get_job_run only ever looks inside one job's own task DAG; this looks at the tables
+    themselves across the whole workspace.
+
+    Needs DATABRICKS_HOST/DATABRICKS_TOKEN (same as get_repo_mapping/get_job_run) plus
+    DATABRICKS_SQL_WAREHOUSE_ID -- reuse the same value already configured for log_incident and
+    for the sibling databricks-job-lineage plugin's own DATABRICKS_SQL_WAREHOUSE_ID if one is
+    registered, rather than a new credential. Queries system.access.table_lineage via a SQL
+    warehouse; requires Unity Catalog lineage tracking enabled on the workspace. The exact column
+    names of that system table can vary by workspace/Databricks release -- this assumes
+    entity_type/entity_run_id/source_table_full_name/target_table_full_name; if this starts
+    erroring, run `DESCRIBE system.access.table_lineage` in a SQL editor and adjust the queries
+    below to match.
+
+    Fails soft, same philosophy as every other tool here: returns an `error` field instead of
+    raising when something's wrong (no warehouse configured, UC lineage not enabled, the query
+    itself errors), and returns genuinely empty lists when there's honestly nothing there (the
+    run never got far enough to read/write anything) -- don't let a caller mistake "couldn't
+    check" for "there's nothing there."
+    """
+    empty = {"tables_read": [], "tables_written": [], "downstream_consumers": []}
+    if not DATABRICKS_SQL_WAREHOUSE_ID:
+        return {
+            **empty,
+            "error": (
+                "DATABRICKS_SQL_WAREHOUSE_ID is not configured -- table lineage requires a SQL "
+                "warehouse to query Unity Catalog system tables."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {**empty, "error": str(exc)}
+
+    from databricks.sdk.errors import DatabricksError
+
+    def run_query(statement):
+        resp = client.statement_execution.execute_statement(
+            warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID,
+            statement=statement,
+            wait_timeout="30s",
+        )
+        if not resp.result or not resp.result.data_array:
+            return []
+        return resp.result.data_array
+
+    try:
+        rows = run_query(
+            f"""
+            SELECT DISTINCT source_table_full_name, target_table_full_name
+            FROM system.access.table_lineage
+            WHERE entity_type = 'JOB' AND entity_run_id = '{run_id}'
+            """
+        )
+    except DatabricksError as exc:
+        return {**empty, "error": f"table_lineage query failed: {exc}"}
+
+    tables_read = sorted({r[0] for r in rows if r and r[0]})
+    tables_written = sorted({r[1] for r in rows if r and r[1]})
+
+    downstream_consumers = []
+    if tables_written:
+        in_clause = ", ".join(f"'{t}'" for t in tables_written)
+        try:
+            consumer_rows = run_query(
+                f"""
+                SELECT DISTINCT entity_type, entity_id
+                FROM system.access.table_lineage
+                WHERE source_table_full_name IN ({in_clause})
+                  AND entity_run_id != '{run_id}'
+                """
+            )
+        except DatabricksError as exc:
+            return {
+                "tables_read": tables_read,
+                "tables_written": tables_written,
+                "downstream_consumers": [],
+                "error": f"downstream consumer lookup failed (tables read/written above are still valid): {exc}",
+            }
+        for entity_type, entity_id in consumer_rows:
+            name = _job_name(client, entity_id) if entity_type == "JOB" else str(entity_id)
+            downstream_consumers.append(
+                {"type": (entity_type or "unknown").lower(), "name": name, "id": str(entity_id)}
+            )
+
+    return {
+        "tables_read": tables_read,
+        "tables_written": tables_written,
+        "downstream_consumers": downstream_consumers,
+        "error": None,
     }
 
 

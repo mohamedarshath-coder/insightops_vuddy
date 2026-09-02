@@ -92,6 +92,7 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `get_job_run` | Databricks `jobs.get_run`/`jobs.get_run_output` via `databricks-sdk` | Phase 1's telemetry fetch. Needs `DATABRICKS_HOST`/`DATABRICKS_TOKEN` (like `get_repo_mapping`). |
 | `get_latest_failed_run` | Databricks `jobs.list_runs`, filtered to the most recent failed/timed-out/canceled run | For resolving a run ID when only a job ID is known. |
 | `trigger_job_run` | Databricks `jobs.run_now`, then polls `jobs.get_run` until a terminal state | Gate 8.5's real-verification re-run. Gated on `OPSBUDDY_VERIFY_ALLOWLIST` (comma-separated job IDs, or `"all"`) — without it, refuses unless `force=true` is passed, which should only happen after a human has explicitly approved that specific re-run. Blocks for up to `timeout_seconds` (default 600s) — same blocking behavior as the CLI it mirrors. |
+| `get_table_lineage` | Unity Catalog system table `system.access.table_lineage` via a SQL warehouse | Real data lineage — which tables a run read from and wrote to, and what else downstream reads those same tables. Distinct from `get_job_run`'s "downstream impact," which only ever looks at task state inside one job's own DAG, never at tables. Needs `DATABRICKS_SQL_WAREHOUSE_ID` (shared with `log_incident`) plus Unity Catalog lineage tracking enabled on the workspace. |
 
 Behind a TLS-intercepting corporate proxy (e.g. Zscaler), `create_pr`/`find_open_pr` need one more
 thing: `OPSBUDDY_EXTRA_CA_CERT` (or it reuses `NODE_EXTRA_CA_CERTS` automatically if that's already

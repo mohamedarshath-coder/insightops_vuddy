@@ -45,7 +45,8 @@ fails/times out — never block the run on an MCP server being present:
 - `opsbuddy-git-ops`, from **this** plugin's own bundled `mcp-server/` (see this repo's top-level
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
   `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
-  `post_slack_alert`, `log_incident`, `read_file`, `write_file`. This is the only tool set in this
+  `post_slack_alert`, `log_incident`, `read_file`, `write_file`, `get_job_run`,
+  `get_latest_failed_run`, `trigger_job_run`, `get_table_lineage`. This is the only tool set in this
   list whose contract is actually verified against this skill's needs (built and tested for it
   specifically) — prefer it over a generically-registered server below whenever both could do the
   same job.

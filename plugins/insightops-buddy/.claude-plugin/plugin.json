@@ -1,7 +1,7 @@
 {
   "name": "insightops-buddy",
-  "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose, ticket (full Kanban lifecycle), fix, PR, review, verify, alert (one threaded 5-stage Slack timeline, tagged with the job ID at every stage), and publish a Confluence postmortem, across 11 phases plus Confluence.",
-  "version": "1.2.0",
+  "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose, ticket (full Kanban lifecycle), fix, PR, review (with CI status surfaced at the merge gate), verify, alert (one threaded 5-stage Slack timeline, tagged with the job ID at every stage), and publish a Confluence postmortem, across 11 phases plus Confluence. Also bundles get_table_lineage for real Unity Catalog data lineage (which tables a run touched, and what else reads them) alongside its Databricks telemetry tools.",
+  "version": "1.3.0",
   "author": {
     "name": "mohamedarshath-coder"
   }
