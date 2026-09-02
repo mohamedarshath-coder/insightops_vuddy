@@ -599,6 +599,21 @@ confirmed in practice to be this exact plugin's own `test_run` job), Gate 8.5 ca
 verify anything pre-merge: merging to `main` is the only way to make the fix visible to a re-run
 at all, which makes the merge decision itself the real gate, not a formality before one.
 
+**Optional: surface CI status, informational only.** This skill deliberately has no CI gate — it
+never blocks, polls, retries, or attempts to fix anything based on check results (that's a much
+larger, separate concern than this skill takes on; see `git-ci-fix` in the `databricks-job-lineage`
+plugin if that's what you actually want). If a GitHub MCP server is connected (e.g. the native
+`github` connector) and exposes some way to read the PR's check/status state — the exact tool name
+varies by server (`get_pull_request_status`, a combined-status tool, `list_check_runs_for_ref`,
+etc.) — call it once and add one line to the approval request below: `CI status: <n>/<total>
+passing`, `CI status: no checks found`, or `CI status: <n> failing — <check names>`. This is purely
+so the human approving isn't blind to it, not a judgment this skill makes on their behalf — don't
+editorialize on what a failure or an absence of checks means (a project with no CI configured looks
+identical to one whose CI silently broke, and this skill isn't equipped to tell them apart — that
+ambiguity is exactly why there's no gate here, only a line of information). If no such tool is
+available, or the call errors, omit the CI status line entirely rather than guessing or blocking
+the approval request on it.
+
 Before merging, present a plain-language approval request — don't just say "should I merge?":
 ```
 PR #<n> — <repo>
@@ -606,6 +621,7 @@ PR #<n> — <repo>
 - Fixes: <one line per AFFECTED_FILE, plain-language what changed>
 - Mode A review: <verdict>, <n>/7
 - Jira: <TICKET-KEY>, incident logged, alert sent
+- CI status: <n>/<total> passing (omit this line entirely if no check-status tool is available)
 
 If you approve, I will:
 1. Merge PR #<n> into <base>.
