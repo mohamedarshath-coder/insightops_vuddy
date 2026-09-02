@@ -200,6 +200,20 @@ Capture job name, task key, life-cycle/result state, full error message and stac
 code; that's a separate fetch in Phase 2/4 (see below), since only the stack trace and file
 names come from telemetry.
 
+**Also pull real data lineage, best-effort:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_table_lineage(run_id="$ARGUMENTS")
+```
+Capture `tables_read`, `tables_written`, and `downstream_consumers` — this is the actual data
+blast radius (what else in the workspace reads the tables this run touched), distinct from and in
+addition to the task-level "Downstream impact" Phase 3's ticket already reports. This needs
+`DATABRICKS_SQL_WAREHOUSE_ID` and Unity Catalog lineage tracking enabled — **if it comes back
+with an `error` (not configured, UC lineage off, query failed), don't block or retry: note
+lineage as "unavailable" in Phase 3's ticket and move on.** This is enrichment, not a
+prerequisite — Phase 2's diagnosis and everything after it proceeds identically whether or not
+this call actually returns data.
+
 ## Phase 2 — Diagnose
 
 Invoke the **databricks-debug** sub-skill with the Phase 1 telemetry. It maps the stack trace
@@ -270,6 +284,14 @@ Run ID: <run_id>
 Failed task: <task_key> (<source_path>)
 Downstream impact: <tasks that went UPSTREAM_FAILED, or "none">
 Run page: <run_page_url>
+
+### Data lineage
+Tables read: <tables_read, or "none">
+Tables written: <tables_written, or "none">
+Downstream consumers: <downstream_consumers -- name + type per line, or "none found">
+(omit this whole section if Phase 1's get_table_lineage call errored or wasn't configured --
+say "unavailable" in one line instead of leaving it out silently, so a reader knows it was
+checked and just couldn't be retrieved, not that no one thought to check)
 
 ### Error
 ```
@@ -783,7 +805,7 @@ mcp__claude_ai_Atlassian__getPagesInConfluenceSpace(cloudId="<cloudId>", spaceId
 #   otherwise mcp__claude_ai_Atlassian__createConfluencePage(cloudId="<cloudId>", spaceId="<space>",
 #   title="<TICKET-KEY>: <job_name> incident", body="<storage-format HTML, see Bash fallback's
 #   build_incident_page_html for the exact structure to mirror: metadata table, root cause,
-#   timeline, how-to-verify, related resources>")
+#   data lineage, timeline, how-to-verify, related resources>")
 
 # Bash fallback (this plugin's own new script — builds the same structure, upsert-by-title)
 python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
@@ -791,8 +813,15 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
   --jira-id <TICKET-KEY> --job-name "<job_name>" --run-id $ARGUMENTS --job-id <job_id> \
   --category "<ERROR_CATEGORY>" --rca "<ROOT_CAUSE_SUMMARY>" --repo "<owner/repo>" \
   --branch "<hotfix branch>" --pr-url <pr_url> --verdict "<mode-a-verdict>" \
-  --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS>
+  --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS> \
+  --tables-read "<Phase 1's tables_read, comma-separated, or 'unavailable'>" \
+  --tables-written "<Phase 1's tables_written, comma-separated, or 'unavailable'>" \
+  --downstream-consumers "<Phase 1's downstream_consumers, comma-separated 'name (type)', or 'unavailable'>"
 ```
+Reuse Phase 1's `get_table_lineage` result here too — don't re-fetch it. Pass `"unavailable"`
+(not an empty string) for any of the three lineage fields if that call errored or was never
+configured, so the page distinguishes "checked, found nothing" from "never checked" the same way
+Phase 3's ticket does.
 Capture the page URL for Phase 11's summary. If neither the Atlassian connector's Confluence
 tools nor `CONFLUENCE_BASE_URL`/`CONFLUENCE_EMAIL`/`CONFLUENCE_API_TOKEN` are configured, note
 that plainly in the final report — same treatment as a missing `SLACK_WEBHOOK_URL` in Phase 10,

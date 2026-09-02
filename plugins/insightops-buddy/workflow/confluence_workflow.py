@@ -162,6 +162,9 @@ def build_incident_page_html(
     execution_status: str,
     author: str = "",
     date: str = "",
+    tables_read: str = "",
+    tables_written: str = "",
+    downstream_consumers: str = "",
 ) -> str:
     if not author:
         author = get("CONFLUENCE_AUTHOR", "opsbuddy-fix")
@@ -180,6 +183,34 @@ def build_incident_page_html(
 
     jira_cell = f'<a href="{jira_url}">{jira_id}</a>' if jira_url else (jira_id or "-")
     pr_cell = f'<a href="{pr_url}">{pr_url}</a>' if pr_url else "-"
+
+    def lineage_field(value: str, empty_label: str) -> str:
+        # "" means get_table_lineage was never called for this run; "unavailable" means it was
+        # called but errored (no warehouse configured, UC lineage off, query failed) -- both are
+        # "don't trust the absence of tables listed here as proof there's nothing to worry
+        # about," same reasoning get_table_lineage's own docstring applies to its return shape,
+        # and must render distinctly from an actual empty result the tool genuinely found.
+        if value == "unavailable":
+            return "<p><em>Unavailable</em> -- lineage lookup wasn't configured or failed for this run.</p>"
+        items = [v.strip() for v in value.split(",") if v.strip()]
+        if not items:
+            return f"<p>{empty_label}</p>"
+        return "<ul>" + "".join(f"<li><code>{i}</code></li>" for i in items) + "</ul>"
+
+    lineage_checked = bool(tables_read or tables_written or downstream_consumers)
+    lineage_html = (
+        f"""
+<h2>&#128472; Data Lineage</h2>
+<h3>Tables read</h3>
+{lineage_field(tables_read, "None")}
+<h3>Tables written</h3>
+{lineage_field(tables_written, "None")}
+<h3>Downstream consumers</h3>
+{lineage_field(downstream_consumers, "None found")}
+"""
+        if lineage_checked
+        else ""
+    )
 
     return f"""
 <ac:structured-macro ac:name="panel">
@@ -205,7 +236,7 @@ def build_incident_page_html(
 
 <h2>&#128269; Root Cause</h2>
 <p>{root_cause_summary or 'No root-cause summary captured.'}</p>
-
+{lineage_html}
 <h2>&#128203; Timeline</h2>
 <ol>
 <li>Incident detected from failed Databricks run, Jira ticket {jira_id or '(none)'} filed and moved to <em>In Progress</em>.</li>
@@ -258,6 +289,9 @@ def cli():
 @click.option("--verification", "verification_result", default="", help="Real re-run verification result")
 @click.option("--status", "execution_status", default="", help="EXECUTION_STATUS")
 @click.option("--parent-id", default=None, help="Parent page ID")
+@click.option("--tables-read", default="", help="Comma-separated tables get_table_lineage found this run read, or 'unavailable' if that call errored/wasn't configured")
+@click.option("--tables-written", default="", help="Comma-separated tables get_table_lineage found this run wrote, or 'unavailable'")
+@click.option("--downstream-consumers", default="", help="Comma-separated 'name (type)' entries from get_table_lineage's downstream_consumers, or 'unavailable'")
 def cmd_upsert_page(
     space,
     title,
@@ -274,6 +308,9 @@ def cmd_upsert_page(
     verification_result,
     execution_status,
     parent_id,
+    tables_read,
+    tables_written,
+    downstream_consumers,
 ):
     """Create or update the incident postmortem page for this run (idempotent by title)."""
     space_key = space or get("CONFLUENCE_SPACE_KEY", "OOP")
@@ -290,6 +327,9 @@ def cmd_upsert_page(
         review_verdict=review_verdict,
         verification_result=verification_result,
         execution_status=execution_status,
+        tables_read=tables_read,
+        tables_written=tables_written,
+        downstream_consumers=downstream_consumers,
     )
     page = ConfluenceClient().upsert_page(space_key, title, body, parent_id)
     click.echo(f"[OK] Confluence page upserted: {page.get('_links', {}).get('webui', '')}")
