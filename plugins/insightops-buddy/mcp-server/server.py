@@ -106,6 +106,38 @@ from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
+
+def _load_dotenv(path: str) -> None:
+    """Minimal stdlib-only ".env" loader -- this server is launched via `uv run` (see
+    .mcp.json), which does not auto-load a .env file on its own, and this file never called
+    python-dotenv itself despite an .env.example existing right next to it. Populates
+    os.environ from KEY=VALUE lines in `path` for any key that isn't already set to a real
+    (non-empty) value -- a genuinely-exported var, or one an MCP client's own env block
+    supplies (even as an empty string from an unresolved ${VAR}), still gets filled in from
+    here rather than silently staying blank. Silently does nothing if the file doesn't exist.
+    """
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            # A blank .env line (KEY=, no value -- what .env.example's optional vars look like)
+            # must NOT get set into os.environ at all: several config reads here do
+            # int(os.environ.get(KEY, "300")) and expect a genuinely-missing key to fall through
+            # to that default, not "" (which int() rejects) -- confirmed in practice, this broke
+            # OPSBUDDY_MCP_TIMEOUT_SECONDS the first time this loader ran against the real
+            # .env.example. An already-set real (non-empty) value always wins either way.
+            if value and not os.environ.get(key):
+                os.environ[key] = value
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -941,6 +973,13 @@ def post_slack_alert(
     blocks = _incident_summary_blocks(incident, stage=stage, message=message)
     import requests
 
+    # Same CA-bundle fix create_pr/find_open_pr and the webhook path below already needed, for
+    # the same reason: behind a TLS-intercepting corporate proxy, requests.post() fails outright
+    # with SSLCertVerificationError against the public CA bundle alone. Confirmed in practice --
+    # this was missing on this specific path (only the webhook fallback had it) and broke the
+    # very first live bot-token Slack call.
+    _ensure_ca_bundle()
+
     if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         payload = {"channel": SLACK_CHANNEL_ID, "text": text, "blocks": blocks}
         if thread_ts:
@@ -969,11 +1008,6 @@ def post_slack_alert(
             "channel": None,
             "error": "Neither SLACK_BOT_TOKEN+SLACK_CHANNEL_ID nor SLACK_WEBHOOK_URL is configured.",
         }
-    # Same CA-bundle fix create_pr/find_open_pr already needed, for the same reason: behind a
-    # TLS-intercepting corporate proxy, requests.post() fails outright with
-    # SSLCertVerificationError against the public CA bundle alone -- confirmed in practice, this
-    # was missing here and broke Slack alerts on a Desktop run behind Zscaler.
-    _ensure_ca_bundle()
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
