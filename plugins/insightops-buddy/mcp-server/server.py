@@ -22,7 +22,7 @@ Tools:
     find_open_pr(repo, search_text)
     read_file(repo_dir, path)
     write_file(repo_dir, path, content)
-    post_slack_alert(jira_ticket_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status)
+    post_slack_alert(jira_ticket_id, job_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status, stage, message, thread_ts)
     log_incident(record)
     get_job_run(run_id)
     get_latest_failed_run(job_id)
@@ -129,8 +129,14 @@ EXTRA_CA_CERT = (
     or os.environ.get("NODE_EXTRA_CA_CERTS", "").strip()
 )
 
-# Only post_slack_alert needs this -- every other tool works with it unset.
+# Only post_slack_alert needs these -- every other tool works with them unset.
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# Optional, preferred over the webhook above when both are set: only the Slack Web API's
+# chat.postMessage (bot-token path) can thread a reply under an earlier message, since an
+# incoming webhook has no way to return the posted message's identity for a later call to reply
+# into. Needs a Slack app with a bot token (xoxb-...) invited into SLACK_CHANNEL_ID.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 
 # Only log_incident needs these -- every other tool works with them unset. The warehouse ID is
 # the same value already used by the databricks-lineage plugin's DATABRICKS_SQL_WAREHOUSE_ID (if
@@ -878,6 +884,7 @@ def _incident_summary_blocks(incident: dict, stage: str = "", message: str = "")
 @mcp.tool()
 def post_slack_alert(
     jira_ticket_id: str = "",
+    job_id: str = "",
     databricks_run_id: str = "",
     error_category: str = "",
     pr_url: str = "",
@@ -885,9 +892,10 @@ def post_slack_alert(
     execution_status: str = "",
     stage: str = "",
     message: str = "",
+    thread_ts: str = "",
 ) -> dict:
-    """Send one opsbuddy-fix Slack checkpoint via SLACK_WEBHOOK_URL. Call this up to five times
-    per run, once per checkpoint -- each post is independent, there is no running thread/state:
+    """Send one opsbuddy-fix Slack checkpoint. Call this up to five times per run, once per
+    checkpoint:
       stage="incident_detected"      -- right after Phase 3 files the Jira ticket. Put the plain-
                                          English root cause / RCA summary in `message`.
       stage="pr_opened"               -- Phase 7, PR opened but not yet merged. Put pr_url.
@@ -897,19 +905,32 @@ def post_slack_alert(
     `stage` only changes the header/emoji shown in Slack -- every other field behaves exactly as
     before, and `stage=""` still sends the original generic "incident summary" header, so existing
     callers that don't pass it keep working unchanged. `message` is free text (e.g. the RCA
-    paragraph or a one-line verification result) shown as its own block below the field grid --
-    there was previously nowhere to put prose like that.
+    paragraph or a one-line verification result) shown as its own block below the field grid.
+    `job_id` is the Databricks job being fixed -- distinct from `databricks_run_id`, which is a
+    specific *run* of that job; pass both when known (job_id stays the same across all five
+    checkpoints of one incident, run_id may not).
+
+    **Threading**: pass no `thread_ts` on the first call (stage="incident_detected") -- that posts
+    the thread's parent. If the response includes a `ts`, keep it and pass it back as `thread_ts`
+    on every later checkpoint's call for this same incident, so all five land as replies in one
+    thread instead of five separate top-level messages. Threading needs SLACK_BOT_TOKEN +
+    SLACK_CHANNEL_ID configured (the Slack Web API's chat.postMessage) -- used automatically
+    instead of the webhook whenever both are set. Falls back to SLACK_WEBHOOK_URL if the bot token
+    isn't configured; `thread_ts` is silently ignored on that path (a webhook can't thread at all,
+    and always posts a new top-level message; the response's `ts` comes back `None`).
+
+    Returns {"sent": bool, "ts": "170000...123", "channel": "C0123...", "error": None} on the
+    bot-token path (ts/channel needed for a later reply), {"sent": bool, "ts": None,
+    "channel": None, "error": None} on the webhook path (nothing to thread into later), or
+    {"sent": False, "ts": None, "channel": None, "error": "..."} if neither is configured or the
+    call fails.
+
     Mirrors workflow/slack_workflow.py's send-incident-summary exactly (same fields, same block
-    layout) so the message looks identical regardless of which client sent it."""
-    if not SLACK_WEBHOOK_URL:
-        return {"sent": False, "error": "SLACK_WEBHOOK_URL must be set for post_slack_alert."}
-    # Same CA-bundle fix create_pr/find_open_pr already needed, for the same reason: behind a
-    # TLS-intercepting corporate proxy, requests.post() fails outright with
-    # SSLCertVerificationError against the public CA bundle alone -- confirmed in practice, this
-    # was missing here and broke Slack alerts on a Desktop run behind Zscaler.
-    _ensure_ca_bundle()
+    layout, same threading contract) so the message looks identical regardless of which client
+    sent it."""
     incident = {
         "Jira Ticket": jira_ticket_id,
+        "Job ID": job_id,
         "Databricks Run ID": databricks_run_id,
         "Error Category": error_category,
         "PR": pr_url,
@@ -917,19 +938,58 @@ def post_slack_alert(
         "Execution Status": execution_status,
     }
     text = f"[opsbuddy-fix] {jira_ticket_id or databricks_run_id} -- {stage or execution_status or 'update'}"
+    blocks = _incident_summary_blocks(incident, stage=stage, message=message)
     import requests
 
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        payload = {"channel": SLACK_CHANNEL_ID, "text": text, "blocks": blocks}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        try:
+            response = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={
+                    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json=payload,
+                timeout=10,
+            )
+            data = response.json()
+        except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+            return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
+        if not data.get("ok"):
+            return {"sent": False, "ts": None, "channel": None, "error": f"Slack API error: {data.get('error')}"}
+        return {"sent": True, "ts": data.get("ts"), "channel": data.get("channel"), "error": None}
+
+    if not SLACK_WEBHOOK_URL:
+        return {
+            "sent": False,
+            "ts": None,
+            "channel": None,
+            "error": "Neither SLACK_BOT_TOKEN+SLACK_CHANNEL_ID nor SLACK_WEBHOOK_URL is configured.",
+        }
+    # Same CA-bundle fix create_pr/find_open_pr already needed, for the same reason: behind a
+    # TLS-intercepting corporate proxy, requests.post() fails outright with
+    # SSLCertVerificationError against the public CA bundle alone -- confirmed in practice, this
+    # was missing here and broke Slack alerts on a Desktop run behind Zscaler.
+    _ensure_ca_bundle()
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
-            json={"text": text, "blocks": _incident_summary_blocks(incident, stage=stage, message=message)},
+            json={"text": text, "blocks": blocks},
             timeout=10,
         )
     except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
-        return {"sent": False, "error": str(exc)}
+        return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
     if response.status_code != 200:
-        return {"sent": False, "error": f"Slack webhook returned {response.status_code}: {response.text}"}
-    return {"sent": True, "error": None}
+        return {
+            "sent": False,
+            "ts": None,
+            "channel": None,
+            "error": f"Slack webhook returned {response.status_code}: {response.text}",
+        }
+    return {"sent": True, "ts": None, "channel": None, "error": None}
 
 
 # ---------------------------------------------------------------------------

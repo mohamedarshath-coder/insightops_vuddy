@@ -5,9 +5,9 @@ description: >-
   telemetry, classify via databricks-debug + the root-cause-analysis (Cat L) agent, file a Jira
   ticket and carry it through a full Kanban lifecycle (To Do -> In Progress -> In Review -> Done),
   gate on whether a code fix is possible, resolve the backing repo, apply and validate the fix,
-  open a PR, run an automated Mode A review, post a 5-stage Slack timeline (detected, PR opened,
-  merged, verifying, resolved), update Jira, log the incident, and publish a Confluence
-  postmortem page. Use whenever given a Databricks job run ID or job ID and asked to fix,
+  open a PR, run an automated Mode A review, post one threaded 5-stage Slack timeline (detected,
+  PR opened, merged, verifying, resolved -- tagged with the job ID at every stage), update Jira,
+  log the incident, and publish a Confluence postmortem page. Use whenever given a Databricks job run ID or job ID and asked to fix,
   resolve, or triage a failure end-to-end (e.g. "job 91004 failed, fix it", "run opsbuddy-fix on
   run 48213"). For read-only diagnosis with no fix/PR, use databricks-debug instead.
 ---
@@ -67,10 +67,10 @@ fails/times out — never block the run on an MCP server being present:
   tools and this script hit the same REST API).
 - A **generic Slack MCP server** (e.g. `@modelcontextprotocol/server-slack`, if registered) —
   `slack_post_message`. Lower priority than this plugin's own `post_slack_alert` above: this one's
-  exact tool name/args aren't verified against your installed server in this session, and it needs
-  a channel ID (`SLACK_CHANNEL_ID` or similar) that `post_slack_alert`/`send-incident-summary`
-  don't need, since both post via `SLACK_WEBHOOK_URL` instead. Only reach for this if
-  `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere.
+  exact tool name/args aren't verified against your installed server in this session. Only reach
+  for this if `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere *and* `post_slack_alert`'s
+  own `SLACK_BOT_TOKEN`+`SLACK_CHANNEL_ID` path (see below) isn't either — `post_slack_alert` can
+  now thread its own replies, so there's rarely a reason to reach past it for a generic server.
 
 Phase 1 telemetry, Phase 7 PR creation, Gate 8.5's real-verification trigger, and Phase 10
 alerting/incident-logging all now have a verified MCP path via this plugin's own
@@ -278,18 +278,25 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "
 
 **Slack alert 1/5 — incident detected.** This is the one checkpoint that carries prose, not just
 fields: put the plain-English root cause (from Phase 2's reconciled verdict) in `message` so the
-channel sees *what actually broke*, not just a category label.
+channel sees *what actually broke*, not just a category label. Also the one checkpoint that starts
+the thread every later alert replies into: it's called with no `thread_ts` (there's nothing to
+reply to yet), and if `SLACK_BOT_TOKEN`+`SLACK_CHANNEL_ID` are configured the response includes a
+`ts` — **keep that value** (same way you already keep `<TICKET-KEY>` and `<pr_url>` for later
+phases) and pass it back as `thread_ts` on alerts 2-5 below, so all five land as one thread instead
+of five separate top-level messages. On the plain-webhook path `ts` comes back `None` — nothing to
+carry forward, later alerts just post standalone, exactly as before threading existed.
 ```
 # MCP-preferred (this plugin's own opsbuddy-git-ops)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  execution_status="IN_PROGRESS", stage="incident_detected",
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", execution_status="IN_PROGRESS", stage="incident_detected",
   message="<ROOT_CAUSE_SUMMARY from Phase 2, 2-4 plain-English sentences>")
 
-# Bash fallback
+# Bash fallback -- prints "THREAD_TS=..." on stdout when the bot-token path is configured; carry
+# that value into --thread-ts on alerts 2-5 the same way
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --status IN_PROGRESS \
-  --stage incident_detected --message "<ROOT_CAUSE_SUMMARY from Phase 2>"
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --status IN_PROGRESS --stage incident_detected --message "<ROOT_CAUSE_SUMMARY from Phase 2>"
 ```
 
 ### ⛔ GATE 3.5 — Feasibility (automated)
@@ -461,17 +468,18 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment-rich <TICKET-KEY>
 ```
 
 **Slack alert 2/5 — PR opened, not yet merged.** Send this regardless of which PR-creation path
-you used — neither path sends Slack on its own.
+you used — neither path sends Slack on its own. Pass alert 1's `thread_ts` if you have one.
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="IN_REVIEW", stage="pr_opened")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="IN_REVIEW",
+  stage="pr_opened", thread_ts="<incident's thread ts, if any>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status IN_REVIEW --stage pr_opened
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status IN_REVIEW --stage pr_opened --thread-ts "<incident's thread ts, if any>"
 ```
 
 ## Phase 8 — Automated PR Review
@@ -496,14 +504,16 @@ real" before the run itself starts, not only the eventual pass/fail:
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="VERIFYING", stage="verification_running",
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="VERIFYING",
+  stage="verification_running", thread_ts="<incident's thread ts, if any>",
   message="Triggering a real re-run of <job_name> (job <job_id>) to verify the fix.")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status VERIFYING --stage verification_running \
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status VERIFYING --stage verification_running \
+  --thread-ts "<incident's thread ts, if any>" \
   --message "Triggering a real re-run of <job_name> (job <job_id>) to verify the fix."
 ```
 
@@ -582,13 +592,14 @@ coming back empty or a direct merged-state check, before sending):
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="MERGED", stage="pr_merged")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="MERGED",
+  stage="pr_merged", thread_ts="<incident's thread ts, if any>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status MERGED --stage pr_merged
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status MERGED --stage pr_merged --thread-ts "<incident's thread ts, if any>"
 ```
 Note the two mechanisms genuinely order alerts 3 and 4 differently, and that's correct, not a
 bug to reconcile: a job verifiable pre-merge (Databricks Repos checkout / job-level git_source)
@@ -637,18 +648,20 @@ sees it as still open, and say so plainly in the final report.
 only one — by this point the channel has already seen alerts 1-4, so `message` here should be the
 one-line verification result (what Gate 8.5 actually found), not a repeat of the RCA from alert 1:
 ```
-# MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via a pre-configured incoming
-# webhook, same as the Bash path; needs no channel ID unlike a generic Slack MCP server would)
+# MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via SLACK_BOT_TOKEN+SLACK_CHANNEL_ID
+# if configured (threaded reply, same thread as alerts 1-4), else the plain incoming webhook)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>", execution_status="<EXECUTION_STATUS>",
-  stage="resolved", message="<one-line Gate 8.5 verification result, or why it was skipped>")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>",
+  execution_status="<EXECUTION_STATUS>", stage="resolved", thread_ts="<incident's thread ts, if any>",
+  message="<one-line Gate 8.5 verification result, or why it was skipped>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
   --pr-url <pr_url> --verdict <mode-a-verdict> --status <EXECUTION_STATUS> \
-  --stage resolved --message "<one-line Gate 8.5 verification result, or why it was skipped>"
+  --stage resolved --thread-ts "<incident's thread ts, if any>" \
+  --message "<one-line Gate 8.5 verification result, or why it was skipped>"
 ```
 If the run halted before reaching a terminal state (Gate 3.5/Phase 5/Phase 8/Gate 8.5), this is
 still the right call to make — just with `EXECUTION_STATUS` set to whichever halt status applies
