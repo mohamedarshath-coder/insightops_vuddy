@@ -28,6 +28,13 @@ Tools:
     get_latest_failed_run(job_id)
     trigger_job_run(job_id, timeout_seconds=600, force=False)
     get_table_lineage(run_id)
+    get_incident_history(job_id, error_category="", days=30)
+
+get_incident_history reads back the incident-log table log_incident only ever wrote to --
+without it, every failure gets diagnosed as if it's the first time that job has ever broken,
+even if the exact same job has failed the same way five times before. Read-only and diagnostic:
+a recurring match is a signal to surface (this may be the Nth time, or the last fix didn't
+stick), never a license to skip re-diagnosis and blindly replay an old fix.
 
 get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, one hop of
 upstream producers of what it read, and one hop of downstream consumers of what it wrote) --
@@ -1483,6 +1490,110 @@ def get_table_lineage(run_id: str) -> dict:
         "tables_written": tables_written,
         "upstream_producers": upstream_producers,
         "downstream_consumers": downstream_consumers,
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 19. get_incident_history
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_incident_history(job_id: str, error_category: str = "", days: int = 30) -> dict:
+    """Look up past incidents for this job from the Databricks ops incident-log table
+    (DATABRICKS_OPS_INCIDENT_TABLE, default dev.ops_incidents.incident_log -- the same table
+    log_incident writes to). log_incident is insert-only; nothing else here ever reads it back,
+    so every failure gets diagnosed as if it's the first time that job has ever broken. Call
+    this in Phase 1, alongside get_job_run, to check that assumption before it's made.
+
+    Filters by databricks_job_id always; optionally narrows further to error_category (exact
+    match) if passed. `days` bounds how far back to look by detected_at (default 30).
+
+    Returns:
+      {"incidents": [{incident_id, jira_ticket_id, error_category, root_cause_summary,
+                       execution_status, pr_url, detected_at, resolved_at}, ...],
+       "count": <int>, "is_recurring": <bool, true if count >= 2>, "error": None}
+    or {"incidents": [], "count": 0, "is_recurring": False, "error": "..."} if
+    DATABRICKS_SQL_WAREHOUSE_ID isn't configured or the query fails -- same fail-soft contract
+    as get_table_lineage: an error here means "couldn't check," not "no history exists," and a
+    caller should say so plainly rather than silently treating this failure as a first-time one.
+
+    Deliberately read-only and diagnostic, not a shortcut: a job with matching history is a
+    signal for the human/reviewing agent (this is the Nth time, or the last fix may not have
+    stuck) -- not a license to skip re-diagnosing and reapply whatever fixed it last time. The
+    code may have changed since; blindly replaying an old patch risks causing a different,
+    new incident instead of preventing one."""
+    empty = {"incidents": [], "count": 0, "is_recurring": False}
+    if not DATABRICKS_SQL_WAREHOUSE_ID:
+        return {
+            **empty,
+            "error": (
+                "DATABRICKS_SQL_WAREHOUSE_ID is not configured -- incident history requires a "
+                "SQL warehouse to query the incident-log table (same var log_incident/"
+                "get_table_lineage already use)."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {**empty, "error": str(exc)}
+
+    # databricks_job_id is stored as a number, not a string (log_incident writes it via
+    # _sql_literal's int branch, unquoted) -- comparing it against a quoted string literal
+    # risks a silent implicit-cast mismatch depending on warehouse settings, so validate and
+    # emit it unquoted here too, matching exactly how it was written.
+    try:
+        job_id_literal = _sql_literal(int(job_id))
+    except (TypeError, ValueError):
+        return {**empty, "error": f"job_id must be an integer, got {job_id!r}"}
+
+    from databricks.sdk.errors import DatabricksError
+
+    category_filter = ""
+    if error_category:
+        escaped = error_category.replace("'", "''")
+        category_filter = f"AND error_category = '{escaped}'"
+
+    sql = f"""
+        SELECT incident_id, jira_ticket_id, error_category, root_cause_summary,
+               execution_status, pr_url, detected_at, resolved_at
+        FROM {DATABRICKS_OPS_INCIDENT_TABLE}
+        WHERE databricks_job_id = {job_id_literal}
+          AND detected_at >= current_timestamp() - INTERVAL {int(days)} DAYS
+          {category_filter}
+        ORDER BY detected_at DESC
+    """
+
+    try:
+        resp = client.statement_execution.execute_statement(
+            statement=sql, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="30s"
+        )
+    except DatabricksError as exc:
+        return {**empty, "error": f"incident history query failed: {exc}"}
+
+    status = resp.status
+    if status and status.state and status.state.value != "SUCCEEDED":
+        return {**empty, "error": f"Databricks SQL statement failed: {status}"}
+
+    rows = resp.result.data_array if resp.result and resp.result.data_array else []
+    incidents = [
+        {
+            "incident_id": r[0],
+            "jira_ticket_id": r[1],
+            "error_category": r[2],
+            "root_cause_summary": r[3],
+            "execution_status": r[4],
+            "pr_url": r[5],
+            "detected_at": r[6],
+            "resolved_at": r[7],
+        }
+        for r in rows
+    ]
+    return {
+        "incidents": incidents,
+        "count": len(incidents),
+        "is_recurring": len(incidents) >= 2,
         "error": None,
     }
 

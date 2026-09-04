@@ -46,9 +46,10 @@ fails/times out — never block the run on an MCP server being present:
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
   `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
   `post_slack_alert`, `log_incident`, `read_file`, `write_file`, `get_job_run`,
-  `get_latest_failed_run`, `trigger_job_run`, `get_table_lineage`. This is the only tool set in this
-  list whose contract is actually verified against this skill's needs (built and tested for it
-  specifically) — prefer it over a generically-registered server below whenever both could do the
+  `get_latest_failed_run`, `trigger_job_run`, `get_table_lineage`, `get_incident_history`. This is
+  the only tool set in this list whose contract is actually verified against this skill's needs
+  (built and tested for it specifically) — prefer it over a generically-registered server below
+  whenever both could do the
   same job.
 - The **Atlassian connector** (`mcp__claude_ai_Atlassian__*`) — `getVisibleJiraProjects`,
   `searchJiraIssuesUsingJql`, `createJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`,
@@ -220,6 +221,22 @@ retry: note lineage as "unavailable" in Phase 3's ticket and move on.** This is 
 prerequisite — Phase 2's diagnosis and everything after it proceeds identically whether or not
 this call actually returns data.
 
+**Also check whether this exact job has failed before:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_incident_history(job_id="<job_id>")
+```
+`log_incident` (Phase 10) is insert-only — nothing before this ever read the incident log back,
+so every failure was diagnosed as if it were the first time, even on a job that's failed the same
+way repeatedly. **If `is_recurring` is true, say so plainly in Phase 3's ticket** — "this job has
+failed N times in the last 30 days, most recently `<jira_ticket_id>` (`<execution_status>`)" —
+this is a signal for the human that the last fix may not have actually stuck, or only covered
+part of the problem, not something to act on unprompted. **Never use this as a shortcut to skip
+Phase 2's diagnosis and just reapply whatever fixed it last time** — the code may have changed
+since, and blindly replaying an old patch risks causing a different, new incident instead of
+preventing one. Same fail-soft treatment as lineage: if it errors (not configured, query failed),
+note history as "unavailable" and continue — this must never block or delay diagnosis.
+
 ## Phase 2 — Diagnose
 
 Invoke the **databricks-debug** sub-skill with the Phase 1 telemetry. It maps the stack trace
@@ -302,6 +319,15 @@ draws on its own)
 (omit this whole section if Phase 1's get_table_lineage call errored or wasn't configured --
 say "unavailable" in one line instead of leaving it out silently, so a reader knows it was
 checked and just couldn't be retrieved, not that no one thought to check)
+
+### Incident history
+<if get_incident_history's count is 0: "No prior incidents found for this job in the last 30
+days.">
+<if count >= 1: "This job has failed N time(s) in the last 30 days. Most recent: <jira_ticket_id>
+(<execution_status>, <error_category>, detected <detected_at>)." -- and if is_recurring, add:
+"This is a recurring failure — the previous fix may not have fully resolved it.">
+(say "unavailable" in one line instead of omitting the section if the call errored or wasn't
+configured, same reasoning as Data lineage above)
 
 ### Error
 ```

@@ -1,7 +1,7 @@
 {
   "name": "insightops-buddy",
-  "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose, ticket (full Kanban lifecycle, now with two-way data lineage: upstream producers and downstream consumers of the tables touched), fix, PR, review (with CI status surfaced at the merge gate), verify, alert (one threaded 5-stage Slack timeline, tagged with the job ID at every stage), and publish a Confluence postmortem, across 11 phases plus Confluence.",
-  "version": "1.4.0",
+  "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose (now checking prior incident history for the same job, not just this run in isolation), ticket (full Kanban lifecycle, with two-way data lineage: upstream producers and downstream consumers of the tables touched), fix, PR, review (with CI status surfaced at the merge gate), verify, alert (one threaded 5-stage Slack timeline, tagged with the job ID at every stage), and publish a Confluence postmortem, across 11 phases plus Confluence.",
+  "version": "1.5.0",
   "author": {
     "name": "mohamedarshath-coder"
   }
