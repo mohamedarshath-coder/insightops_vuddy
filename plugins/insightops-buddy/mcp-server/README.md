@@ -80,6 +80,7 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `git_status` | `git branch --show-current`, `git status --porcelain` | Check before `git_commit` to confirm exactly what will be staged. |
 | `git_commit` | `git add <files>`, `git commit -m <message>` | Returns the new commit SHA. |
 | `git_push` | `git push -u <remote> <branch>` | Authenticated via `GIT_ASKPASS` if `GITHUB_TOKEN` is set — the token never touches `.git/config` or the URL. |
+| `git_cleanup` | `shutil.rmtree` on a resolved `repo_dir` | The only delete capability anywhere on this server, and deliberately narrow — same `OPSBUDDY_MCP_WORKDIR` sandbox as every `git_*`/`read_file`/`write_file` tool. Closes a real gap: opsbuddy-fix clones a fresh checkout per incident (and again per retry), with no way to remove it afterward, so clones accumulated under the workdir indefinitely. Call once a PR has merged or the incident's abandoned. A `repo_dir` that's already gone returns `{"deleted": true}`, not an error — the requested end state already holds either way. |
 | `run_static_checks` | `black --check`, `isort --check`, `flake8 --max-line-length=120`, `python -m py_compile`, then `pytest` on any matching `python/tests/test_<module>.py` | Mirrors the `testing` skill's Step 2 exactly; non-`.py` files in the list are reported as skipped, not silently dropped. |
 | `run_pytest` | `pytest <test_path> -m <markers> -v` | For ad-hoc/retry test runs outside the fixed `test_<module>.py` convention. |
 | `get_repo_mapping` | Databricks Repos list / job `git_source` lookup via `databricks-sdk`, or a regex scan of a passed-in `source_content` string | The only tool needing `DATABRICKS_HOST`/`DATABRICKS_TOKEN` — everything else works with neither set. Re-implements the same lookup `databricks-job-lineage`'s own `get_repo_mapping` does (so this plugin doesn't depend on that one being installed), plus a third fallback neither has: scanning already-fetched task source for a hardcoded git URL, for jobs whose task code clones a repo manually rather than using either official Databricks git-linkage mechanism. |
@@ -93,7 +94,7 @@ ends up registered twice, once as a bare `opsbuddy-git-ops` and once as this plu
 | `get_latest_failed_run` | Databricks `jobs.list_runs`, filtered to the most recent failed/timed-out/canceled run | For resolving a run ID when only a job ID is known. |
 | `trigger_job_run` | Databricks `jobs.run_now`, then polls `jobs.get_run` until a terminal state | Gate 8.5's real-verification re-run. Gated on `OPSBUDDY_VERIFY_ALLOWLIST` (comma-separated job IDs, or `"all"`) — without it, refuses unless `force=true` is passed, which should only happen after a human has explicitly approved that specific re-run. Blocks for up to `timeout_seconds` (default 600s) — same blocking behavior as the CLI it mirrors. |
 | `get_table_lineage` | Unity Catalog system table `system.access.table_lineage` via a SQL warehouse | Real data lineage — which tables a run read from and wrote to, one hop of `upstream_producers` (what wrote the tables it read — check this if the real root cause is bad data from further back, not this job's own code), and one hop of `downstream_consumers` (what reads the tables it wrote). Distinct from `get_job_run`'s "downstream impact," which only ever looks at task state inside one job's own DAG, never at tables. Needs `DATABRICKS_SQL_WAREHOUSE_ID` (shared with `log_incident`) plus Unity Catalog lineage tracking enabled on the workspace. |
-| `get_incident_history` | `SELECT` against the same incident-log table `log_incident` writes to, via a SQL warehouse | Has this job failed before? `log_incident` was insert-only until this tool existed — nothing ever read it back, so every failure was diagnosed as a first-time event even on a job that's failed the same way repeatedly. Filters by `job_id` (required), optionally `error_category`, bounded by `days` (default 30). Returns `is_recurring: true` once 2+ matches exist — a signal to surface prominently, not a shortcut to skip re-diagnosis and replay an old fix blind. Needs `DATABRICKS_SQL_WAREHOUSE_ID` (same as `log_incident`/`get_table_lineage`). |
+| `get_incident_history` | `SELECT` against the same incident-log table `log_incident` writes to, via a SQL warehouse | Has this job failed before — or is a whole error category breaking multiple jobs at once? `log_incident` was insert-only until this tool existed — nothing ever read it back, so every failure was diagnosed as a first-time event even on a job that's failed the same way repeatedly. Requires at least one of `job_id`/`error_category`; leaving `job_id` empty turns it into a cross-job query (e.g. "has any job hit Schema Mismatch in the last 7 days"), bounded by `days` (default 30). Returns `is_recurring: true` once 2+ matches exist and `distinct_jobs_affected` (the real platform-wide signal — 5 hits on one job isn't the same story as 5 hits spread across 5 jobs). A signal to surface prominently, never a shortcut to skip re-diagnosis and replay an old fix blind. Needs `DATABRICKS_SQL_WAREHOUSE_ID` (same as `log_incident`/`get_table_lineage`). |
 
 Behind a TLS-intercepting corporate proxy (e.g. Zscaler), `create_pr`/`find_open_pr` need one more
 thing: `OPSBUDDY_EXTRA_CA_CERT` (or it reuses `NODE_EXTRA_CA_CERTS` automatically if that's already
@@ -106,6 +107,14 @@ correct `GITHUB_TOKEN`. The server builds a combined bundle (public CAs + that c
 real incident-log insert followed by a manual cleanup delete) after a real Desktop-driven run
 correctly reported both as unavailable rather than fake having done them — the honest report is
 what surfaced this as a gap worth closing, not a guess.
+
+Every tool that touches a SQL warehouse (`log_incident`, `get_table_lineage`,
+`get_incident_history`) shares one execution helper that polls a statement's status every 2s
+instead of blocking on one long `wait_timeout` call. This isn't cosmetic: a stopped/auto-
+suspended SQL warehouse commonly takes 30-60s+ to wake up, and a single call blocking that long
+risks exceeding the *caller's* own timeout — confirmed in practice, `log_incident` timed out
+this exact way on a real run (indistinguishable, from the caller's side, from the server being
+unresponsive), even though the insert would have succeeded once the warehouse finished starting.
 
 ## Safety model
 

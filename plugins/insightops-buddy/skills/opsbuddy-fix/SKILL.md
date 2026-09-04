@@ -44,7 +44,7 @@ fails/times out — never block the run on an MCP server being present:
   adjust if it differs.
 - `opsbuddy-git-ops`, from **this** plugin's own bundled `mcp-server/` (see this repo's top-level
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
-  `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
+  `git_cleanup`, `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
   `post_slack_alert`, `log_incident`, `read_file`, `write_file`, `get_job_run`,
   `get_latest_failed_run`, `trigger_job_run`, `get_table_lineage`, `get_incident_history`. This is
   the only tool set in this list whose contract is actually verified against this skill's needs
@@ -237,6 +237,20 @@ since, and blindly replaying an old patch risks causing a different, new inciden
 preventing one. Same fail-soft treatment as lineage: if it errors (not configured, query failed),
 note history as "unavailable" and continue — this must never block or delay diagnosis.
 
+**After Phase 2 assigns `ERROR_CATEGORY`, also check whether it's showing up platform-wide:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_incident_history(error_category="<ERROR_CATEGORY>")
+```
+This is a separate query from the job-scoped one above — it looks across **every** job in the
+window, not just this one, so it catches platform-wide causes (e.g. an ANSI-mode runtime upgrade
+that silently breaks every job doing lenient date parsing) that only ever show up as isolated,
+unrelated-looking incidents when checked one job at a time. **If `distinct_jobs_affected` is
+greater than 1, say so plainly in Phase 3's ticket** — "`<ERROR_CATEGORY>` has also hit N other
+job(s) in the last 30 days: `<job ids>`" — again a lead for the human, not something this skill
+acts on by broadening its own fix beyond the job it was asked to diagnose. Same fail-soft
+treatment: if it errors or isn't configured, note as "unavailable" and continue.
+
 ## Phase 2 — Diagnose
 
 Invoke the **databricks-debug** sub-skill with the Phase 1 telemetry. It maps the stack trace
@@ -321,13 +335,17 @@ say "unavailable" in one line instead of leaving it out silently, so a reader kn
 checked and just couldn't be retrieved, not that no one thought to check)
 
 ### Incident history
-<if get_incident_history's count is 0: "No prior incidents found for this job in the last 30
-days.">
+<if get_incident_history(job_id=...)'s count is 0: "No prior incidents found for this job in the
+last 30 days.">
 <if count >= 1: "This job has failed N time(s) in the last 30 days. Most recent: <jira_ticket_id>
 (<execution_status>, <error_category>, detected <detected_at>)." -- and if is_recurring, add:
 "This is a recurring failure — the previous fix may not have fully resolved it.">
 (say "unavailable" in one line instead of omitting the section if the call errored or wasn't
 configured, same reasoning as Data lineage above)
+<if get_incident_history(error_category=...)'s distinct_jobs_affected > 1: "<ERROR_CATEGORY> has
+also affected N other job(s) in the last 30 days: <job ids>, suggesting a platform-wide cause
+rather than something isolated to this job.">
+(omit this line entirely if distinct_jobs_affected <= 1 -- no need to state a negative)
 
 ### Error
 ```
@@ -866,10 +884,12 @@ not a silent skip and not a hard failure of the whole run.
 
 ## Phase 11 — Summary
 
-Clean up the isolated clone: `rm -rf <repo_dir>` in Bash mode. `opsbuddy-git-ops` exposes no
-delete tool by design (minimal write surface — see its README's safety model), so clones made via
-MCP accumulate under its workdir; note that plainly in the final report rather than silently
-leaving it unaddressed, and clean it up manually/periodically outside this skill. Then print:
+Clean up the isolated clone: call `git_cleanup(repo_dir)` (MCP mode) — it deletes `repo_dir`
+but only when it resolves under `opsbuddy-git-ops`'s own `OPSBUDDY_MCP_WORKDIR`, refusing anything
+outside it (same sandboxing as every other tool in this server, not a general delete capability).
+In Bash mode, `rm -rf <repo_dir>` is the equivalent fallback. Report whether cleanup succeeded
+(`deleted: true/false` plus `error`) in the final summary below rather than silently leaving it
+unaddressed. Then print:
 ```
 <✅ | ⚠️> <TICKET-KEY> — <EXECUTION_STATUS>
 ══════════════════════════════════════
@@ -886,6 +906,7 @@ leaving it unaddressed, and clean it up manually/periodically outside this skill
                  list any of the 5 that never fired and why, e.g. "3/4 skipped: halted at Gate 3.5")
   Databricks row: <incident_id/skipped>
   Confluence   : <page_url/skipped (reason)>
+  Cleanup      : <deleted/failed (error)>
 ══════════════════════════════════════
 ```
 If the run halted at Gate 3.5, Phase 5, Phase 8, or Gate 8.5, state clearly which phase it

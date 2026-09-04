@@ -15,6 +15,7 @@ Tools:
     git_status(repo_dir)
     git_commit(repo_dir, message, files)
     git_push(repo_dir, branch, remote="origin")
+    git_cleanup(repo_dir)
     run_static_checks(repo_dir, files)
     run_pytest(repo_dir, test_path, markers="not integration")
     get_repo_mapping(source_path, job_id="", source_content="")
@@ -28,13 +29,28 @@ Tools:
     get_latest_failed_run(job_id)
     trigger_job_run(job_id, timeout_seconds=600, force=False)
     get_table_lineage(run_id)
-    get_incident_history(job_id, error_category="", days=30)
+    get_incident_history(job_id="", error_category="", days=30)
+
+git_cleanup is the one and only delete capability on this server, and deliberately narrow --
+same WORKDIR sandbox as every git_*/read_file/write_file tool, nothing else. Closes a real,
+confirmed-in-practice gap: opsbuddy-fix clones a fresh working tree per incident (and again per
+retry), and had no way to remove it afterward, so clones accumulated under the workdir forever.
+Call it once a PR has merged (or the incident's abandoned) and the checkout is no longer needed.
 
 get_incident_history reads back the incident-log table log_incident only ever wrote to --
 without it, every failure gets diagnosed as if it's the first time that job has ever broken,
-even if the exact same job has failed the same way five times before. Read-only and diagnostic:
-a recurring match is a signal to surface (this may be the Nth time, or the last fix didn't
-stick), never a license to skip re-diagnosis and blindly replay an old fix.
+even if the exact same job has failed the same way five times before, or a whole error category
+is breaking multiple unrelated jobs at once (job_id can be left empty to query by error_category
+alone, across every job, surfacing that platform-wide shape via distinct_jobs_affected). Read-
+only and diagnostic: a recurring match is a signal to surface (this may be the Nth time, or the
+last fix didn't stick), never a license to skip re-diagnosis and blindly replay an old fix.
+
+All SQL-warehouse-backed tools (log_incident, get_table_lineage, get_incident_history) share one
+execution helper, _execute_sql, that polls instead of blocking on a single long
+execute_statement(wait_timeout=...) call -- confirmed in practice, that blocking pattern caused
+log_incident to time out (indistinguishable, from the caller's side, from the server being
+unresponsive) against a cold-starting SQL warehouse, even though the statement would have
+succeeded once the warehouse woke up 30-60s later.
 
 get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, one hop of
 upstream producers of what it read, and one hop of downstream consumers of what it wrote) --
@@ -410,6 +426,58 @@ def _databricks_client():
     return WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
 
 
+def _execute_sql(client, statement: str, timeout_seconds: int = 90) -> list:
+    """Run one SQL statement against DATABRICKS_SQL_WAREHOUSE_ID, tolerating a cold-starting
+    warehouse. A stopped/auto-suspended SQL warehouse commonly takes 30-60s+ to wake up --
+    blocking a single execute_statement(wait_timeout=...) call that long risks exceeding the
+    *caller's* own timeout, not just this server's. Confirmed in practice: log_incident timed out
+    this exact way against a stopped warehouse (indistinguishable, from the caller's side, from
+    the server itself being unresponsive) even though the statement would have succeeded once the
+    warehouse finished starting.
+
+    Polls instead of blocking on one call: fires with wait_timeout="0s" (returns immediately in
+    PENDING/RUNNING), then polls get_statement every 2s until a terminal state or
+    `timeout_seconds` total elapses -- so no single API call blocks for more than a couple
+    seconds, no matter how long the whole operation actually takes.
+
+    Returns the result rows (a list, possibly empty) on success. Raises RuntimeError on any
+    failure -- the initial call failing, the statement reaching FAILED/CANCELED/CLOSED, or timing
+    out while still PENDING/RUNNING -- so every caller can use one ordinary `except RuntimeError`,
+    shared by every tool that touches a SQL warehouse (log_incident, get_table_lineage,
+    get_incident_history) so this cold-start tolerance stays identical across all of them instead
+    of being reimplemented (or not) per tool."""
+    try:
+        resp = client.statement_execution.execute_statement(
+            statement=statement, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="0s"
+        )
+    except Exception as exc:  # noqa: BLE001 -- DatabricksError, network, etc. all reduce to one verdict
+        raise RuntimeError(str(exc)) from exc
+
+    statement_id = resp.statement_id
+    elapsed = 0
+    poll_interval = 2
+    while True:
+        status = resp.status
+        state = status.state.value if status and status.state else None
+        if state == "SUCCEEDED":
+            return resp.result.data_array if resp.result and resp.result.data_array else []
+        if state in ("FAILED", "CANCELED", "CLOSED"):
+            raise RuntimeError(f"Databricks SQL statement failed: {status}")
+        if elapsed >= timeout_seconds:
+            raise RuntimeError(
+                f"Databricks SQL statement did not reach a terminal state within "
+                f"{timeout_seconds}s (state={state!r}, statement_id={statement_id}) -- the "
+                f"warehouse may still be starting; the statement itself may still complete on "
+                f"the Databricks side even though this call gave up waiting for it."
+            )
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            resp = client.statement_execution.get_statement(statement_id)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"polling statement {statement_id} failed: {exc}") from exc
+
+
 # Matches a git-clonable URL, optionally with an embedded credential (https://TOKEN@host/... or
 # a bare user@host: SSH form), ending in a repo path. Deliberately conservative -- would rather
 # miss an unusual URL shape than mis-extract something that isn't really a repo URL.
@@ -563,6 +631,51 @@ def git_push(repo_dir: str, branch: str, remote: str = "origin") -> dict:
     if proc.returncode != 0:
         return {"pushed": False, "error": proc.stderr.strip()}
     return {"pushed": True, "error": None}
+
+
+# ---------------------------------------------------------------------------
+# 5b. git_cleanup
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def git_cleanup(repo_dir: str) -> dict:
+    """Delete a cloned repo's working directory. Deliberately the *only* delete capability on
+    this server, and deliberately narrow: `_resolve_under_workdir` still applies, so this can
+    only ever remove something under OPSBUDDY_MCP_WORKDIR (the same sandbox every other git_*/
+    read_file/write_file tool is confined to) -- it cannot be pointed at anything else on disk,
+    no matter what path is passed.
+
+    Confirmed in practice this was a real, growing gap: opsbuddy-fix clones a fresh working tree
+    per incident (and again per retry -- SCRUM-84 alone left two: SCRUM-84 and SCRUM-84-retry)
+    and this server had no way to remove them afterward, so they accumulate under the workdir
+    indefinitely across every incident this pipeline ever handles. Call this once a PR has
+    merged (or the incident is otherwise closed/abandoned) and the local clone is no longer
+    needed -- not before, since a later phase (or Gate 8.5's retry) may still need to read or
+    write from it.
+
+    Returns {"deleted": True, "error": None} on success, {"deleted": False, "error": "..."} if
+    repo_dir doesn't resolve under the workdir, doesn't exist (already gone -- not itself an
+    error worth failing over, see below), or couldn't be removed (e.g. a file still open/locked
+    on Windows). A repo_dir that's already gone returns {"deleted": True, "error": None} too --
+    the end state ("this path has no repo checkout") is what's being asked for either way."""
+    try:
+        target = _resolve_under_workdir(repo_dir)
+    except ValueError as exc:
+        return {"deleted": False, "error": str(exc)}
+
+    if not target.exists():
+        return {"deleted": True, "error": None}
+    if not target.is_dir():
+        return {"deleted": False, "error": f"{target} is not a directory -- refusing to remove"}
+
+    import shutil
+
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        return {"deleted": False, "error": f"failed to remove {target}: {exc}"}
+    return {"deleted": True, "error": None}
 
 
 # ---------------------------------------------------------------------------
@@ -1108,18 +1221,10 @@ def log_incident(record: dict) -> dict:
         f"VALUES ({', '.join(values)})"
     )
 
-    from databricks.sdk.errors import DatabricksError
-
     try:
-        response = client.statement_execution.execute_statement(
-            statement=sql, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="30s"
-        )
-    except DatabricksError as exc:
+        _execute_sql(client, sql)
+    except RuntimeError as exc:
         return {"logged": False, "error": str(exc)}
-
-    status = response.status
-    if status and status.state and status.state.value != "SUCCEEDED":
-        return {"logged": False, "error": f"Databricks SQL statement failed: {status}"}
     return {"logged": True, "incident_id": record.get("incident_id"), "error": None}
 
 
@@ -1411,17 +1516,8 @@ def get_table_lineage(run_id: str) -> dict:
     except RuntimeError as exc:
         return {**empty, "error": str(exc)}
 
-    from databricks.sdk.errors import DatabricksError
-
     def run_query(statement):
-        resp = client.statement_execution.execute_statement(
-            warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID,
-            statement=statement,
-            wait_timeout="30s",
-        )
-        if not resp.result or not resp.result.data_array:
-            return []
-        return resp.result.data_array
+        return _execute_sql(client, statement)
 
     try:
         rows = run_query(
@@ -1431,7 +1527,7 @@ def get_table_lineage(run_id: str) -> dict:
             WHERE entity_type = 'JOB' AND entity_run_id = '{run_id}'
             """
         )
-    except DatabricksError as exc:
+    except RuntimeError as exc:
         return {**empty, "error": f"table_lineage query failed: {exc}"}
 
     tables_read = sorted({r[0] for r in rows if r and r[0]})
@@ -1453,7 +1549,7 @@ def get_table_lineage(run_id: str) -> dict:
                   AND entity_run_id != '{run_id}'
                 """
             )
-        except DatabricksError as exc:
+        except RuntimeError as exc:
             return [], str(exc)
         entities = [
             {
@@ -1500,31 +1596,48 @@ def get_table_lineage(run_id: str) -> dict:
 
 
 @mcp.tool()
-def get_incident_history(job_id: str, error_category: str = "", days: int = 30) -> dict:
-    """Look up past incidents for this job from the Databricks ops incident-log table
+def get_incident_history(job_id: str = "", error_category: str = "", days: int = 30) -> dict:
+    """Look up past incidents from the Databricks ops incident-log table
     (DATABRICKS_OPS_INCIDENT_TABLE, default dev.ops_incidents.incident_log -- the same table
     log_incident writes to). log_incident is insert-only; nothing else here ever reads it back,
     so every failure gets diagnosed as if it's the first time that job has ever broken. Call
     this in Phase 1, alongside get_job_run, to check that assumption before it's made.
 
-    Filters by databricks_job_id always; optionally narrows further to error_category (exact
-    match) if passed. `days` bounds how far back to look by detected_at (default 30).
+    At least one of `job_id`/`error_category` must be passed -- an unfiltered scan of the whole
+    table isn't a query this tool is meant to make easy to do by accident. Two shapes:
+      - `job_id` only (or with `error_category` too): "has *this specific job* failed before?"
+        -- the original, narrower question.
+      - `error_category` with `job_id` left empty: "has *any* job hit this failure category
+        recently?" -- catches a platform-wide issue (e.g. a Databricks Runtime upgrade that
+        silently changed ANSI SQL defaults and started breaking every job using a certain date-
+        parsing pattern) that looking at one job in isolation would never surface, since each
+        affected job just looks like its own unrelated, first-time incident.
+    `days` bounds how far back to look by detected_at (default 30).
 
     Returns:
-      {"incidents": [{incident_id, jira_ticket_id, error_category, root_cause_summary,
-                       execution_status, pr_url, detected_at, resolved_at}, ...],
-       "count": <int>, "is_recurring": <bool, true if count >= 2>, "error": None}
-    or {"incidents": [], "count": 0, "is_recurring": False, "error": "..."} if
-    DATABRICKS_SQL_WAREHOUSE_ID isn't configured or the query fails -- same fail-soft contract
-    as get_table_lineage: an error here means "couldn't check," not "no history exists," and a
+      {"incidents": [{incident_id, jira_ticket_id, databricks_job_id, error_category,
+                      root_cause_summary, execution_status, pr_url, detected_at, resolved_at},
+                      ...], "count": <int>, "distinct_jobs_affected": <int>,
+       "is_recurring": <bool, true if count >= 2>, "error": None}
+    or the same shape with empty/zero values and `error` set if DATABRICKS_SQL_WAREHOUSE_ID isn't
+    configured, no filter was given, or the query fails -- same fail-soft contract as
+    get_table_lineage: an error here means "couldn't check," not "no history exists," and a
     caller should say so plainly rather than silently treating this failure as a first-time one.
+    `distinct_jobs_affected` is what actually signals "platform-wide" on an error_category-only
+    query -- 5 incidents that are all the same one job recurring isn't the same story as 5
+    incidents spread across 5 different jobs on the same day.
 
-    Deliberately read-only and diagnostic, not a shortcut: a job with matching history is a
-    signal for the human/reviewing agent (this is the Nth time, or the last fix may not have
-    stuck) -- not a license to skip re-diagnosing and reapply whatever fixed it last time. The
-    code may have changed since; blindly replaying an old patch risks causing a different,
-    new incident instead of preventing one."""
-    empty = {"incidents": [], "count": 0, "is_recurring": False}
+    Deliberately read-only and diagnostic, not a shortcut: matching history is a signal for the
+    human/reviewing agent (this is the Nth time, the last fix may not have stuck, or this looks
+    bigger than one job) -- not a license to skip re-diagnosing and reapply whatever fixed it
+    last time. The code may have changed since; blindly replaying an old patch risks causing a
+    different, new incident instead of preventing one."""
+    empty = {"incidents": [], "count": 0, "distinct_jobs_affected": 0, "is_recurring": False}
+    if not job_id and not error_category:
+        return {
+            **empty,
+            "error": "At least one of job_id/error_category must be passed.",
+        }
     if not DATABRICKS_SQL_WAREHOUSE_ID:
         return {
             **empty,
@@ -1543,12 +1656,12 @@ def get_incident_history(job_id: str, error_category: str = "", days: int = 30) 
     # _sql_literal's int branch, unquoted) -- comparing it against a quoted string literal
     # risks a silent implicit-cast mismatch depending on warehouse settings, so validate and
     # emit it unquoted here too, matching exactly how it was written.
-    try:
-        job_id_literal = _sql_literal(int(job_id))
-    except (TypeError, ValueError):
-        return {**empty, "error": f"job_id must be an integer, got {job_id!r}"}
-
-    from databricks.sdk.errors import DatabricksError
+    job_filter = ""
+    if job_id:
+        try:
+            job_filter = f"AND databricks_job_id = {_sql_literal(int(job_id))}"
+        except (TypeError, ValueError):
+            return {**empty, "error": f"job_id must be an integer, got {job_id!r}"}
 
     category_filter = ""
     if error_category:
@@ -1556,43 +1669,38 @@ def get_incident_history(job_id: str, error_category: str = "", days: int = 30) 
         category_filter = f"AND error_category = '{escaped}'"
 
     sql = f"""
-        SELECT incident_id, jira_ticket_id, error_category, root_cause_summary,
-               execution_status, pr_url, detected_at, resolved_at
+        SELECT incident_id, jira_ticket_id, databricks_job_id, error_category,
+               root_cause_summary, execution_status, pr_url, detected_at, resolved_at
         FROM {DATABRICKS_OPS_INCIDENT_TABLE}
-        WHERE databricks_job_id = {job_id_literal}
-          AND detected_at >= current_timestamp() - INTERVAL {int(days)} DAYS
+        WHERE detected_at >= current_timestamp() - INTERVAL {int(days)} DAYS
+          {job_filter}
           {category_filter}
         ORDER BY detected_at DESC
     """
 
     try:
-        resp = client.statement_execution.execute_statement(
-            statement=sql, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="30s"
-        )
-    except DatabricksError as exc:
+        rows = _execute_sql(client, sql)
+    except RuntimeError as exc:
         return {**empty, "error": f"incident history query failed: {exc}"}
 
-    status = resp.status
-    if status and status.state and status.state.value != "SUCCEEDED":
-        return {**empty, "error": f"Databricks SQL statement failed: {status}"}
-
-    rows = resp.result.data_array if resp.result and resp.result.data_array else []
     incidents = [
         {
             "incident_id": r[0],
             "jira_ticket_id": r[1],
-            "error_category": r[2],
-            "root_cause_summary": r[3],
-            "execution_status": r[4],
-            "pr_url": r[5],
-            "detected_at": r[6],
-            "resolved_at": r[7],
+            "databricks_job_id": r[2],
+            "error_category": r[3],
+            "root_cause_summary": r[4],
+            "execution_status": r[5],
+            "pr_url": r[6],
+            "detected_at": r[7],
+            "resolved_at": r[8],
         }
         for r in rows
     ]
     return {
         "incidents": incidents,
         "count": len(incidents),
+        "distinct_jobs_affected": len({i["databricks_job_id"] for i in incidents}),
         "is_recurring": len(incidents) >= 2,
         "error": None,
     }
