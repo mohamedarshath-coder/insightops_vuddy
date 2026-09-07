@@ -23,7 +23,8 @@ Tools:
     find_open_pr(repo, search_text)
     read_file(repo_dir, path)
     write_file(repo_dir, path, content)
-    post_slack_alert(jira_ticket_id, job_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status, stage, message, thread_ts)
+    post_slack_alert(jira_ticket_id, job_id, databricks_run_id, error_category, pr_url,
+        pr_review_verdict, execution_status, stage, message, thread_ts)
     log_incident(record)
     get_job_run(run_id)
     get_latest_failed_run(job_id)
@@ -122,7 +123,7 @@ private repo; SSH remotes need nothing from this server), but REQUIRED for creat
 Run it:
     pip install -r requirements.txt
     export GITHUB_TOKEN=ghp_...        # optional, HTTPS clones/pushes of private repos only
-    export OPSBUDDY_MCP_WORKDIR=D:\opsbuddy\opsbuddy-git-workdir   # optional, see default below
+    export OPSBUDDY_MCP_WORKDIR=D:\\opsbuddy\\opsbuddy-git-workdir   # optional, see default below
     python server.py
 
 Then point an MCP client (Claude Desktop, Claude Code, etc.) at it as a stdio server -- see
@@ -218,7 +219,9 @@ DATABRICKS_OPS_INCIDENT_TABLE = os.environ.get(
 # keeps a bad or malicious path from writing/deleting outside a known sandbox. Defaults to a
 # folder next to this script so `python server.py` works with zero required config.
 WORKDIR = Path(
-    os.environ.get("OPSBUDDY_MCP_WORKDIR", str(Path(__file__).resolve().parent / "workdir"))
+    os.environ.get(
+        "OPSBUDDY_MCP_WORKDIR", str(Path(__file__).resolve().parent / "workdir")
+    )
 ).resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
@@ -277,7 +280,8 @@ def _resolve_repo_relative(repo_dir: str, rel_path: str) -> Path:
     land outside that repo's own working tree (a `../` escape) or inside `.git/` (repo internals,
     never a source file a fix should touch). Reuses `_resolve_under_workdir` first so `repo_dir`
     itself still has to be a real, already-existing checkout under the server's sandboxed
-    workdir -- this adds a second, narrower boundary on top of that: the repo root itself."""
+    workdir -- this adds a second, narrower boundary on top of that: the repo root itself.
+    """
     repo = _resolve_under_workdir(repo_dir, must_exist=True)
     candidate = (repo / rel_path).resolve()
     try:
@@ -285,7 +289,9 @@ def _resolve_repo_relative(repo_dir: str, rel_path: str) -> Path:
     except ValueError:
         raise ValueError(f"{rel_path!r} resolves outside repo_dir {repo} -- refusing")
     if relative.parts and relative.parts[0] == ".git":
-        raise ValueError(f"{rel_path!r} is inside .git/ -- refusing to touch repo internals")
+        raise ValueError(
+            f"{rel_path!r} is inside .git/ -- refusing to touch repo internals"
+        )
     return candidate
 
 
@@ -293,11 +299,14 @@ def _kill_process_tree(pid: int) -> None:
     """Best-effort kill of a process AND its children. A plain .kill()/.terminate() only
     signals the immediate process -- git and lint/test tools can spawn helper subprocesses
     that survive that, leaving a "timed out" tool call quietly orphaned in the background
-    forever. `taskkill /T` (Windows) / process-group SIGKILL (POSIX) kills the whole tree."""
+    forever. `taskkill /T` (Windows) / process-group SIGKILL (POSIX) kills the whole tree.
+    """
     try:
         if os.name == "nt":
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
             )
         else:
             import signal
@@ -307,7 +316,12 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
-def _run(args: List[str], cwd: Path, env: Optional[dict] = None, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+def _run(
+    args: List[str],
+    cwd: Path,
+    env: Optional[dict] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess:
     """subprocess.run-alike used for every git/lint/test invocation in this server.
 
     Two things a plain `subprocess.run(..., timeout=...)` does NOT reliably give you, both
@@ -339,14 +353,21 @@ def _run(args: List[str], cwd: Path, env: Optional[dict] = None, timeout: Option
         _kill_process_tree(proc.pid)
         try:
             proc.communicate(timeout=10)
-        except Exception:  # noqa: BLE001 - already killed; just reclaim the pipes if possible
+        except (
+            Exception
+        ):  # noqa: BLE001 - already killed; just reclaim the pipes if possible
             pass
         return subprocess.CompletedProcess(
-            args, -1, "", f"timed out after {timeout or SUBPROCESS_TIMEOUT_SECONDS}s and was killed"
+            args,
+            -1,
+            "",
+            f"timed out after {timeout or SUBPROCESS_TIMEOUT_SECONDS}s and was killed",
         )
 
 
-def _run_git(args: List[str], cwd: Path, env: Optional[dict] = None) -> subprocess.CompletedProcess:
+def _run_git(
+    args: List[str], cwd: Path, env: Optional[dict] = None
+) -> subprocess.CompletedProcess:
     return _run(["git", *args], cwd=cwd, env=env)
 
 
@@ -398,8 +419,11 @@ def _environment_gap_hint(result: dict) -> dict:
     confirmed in practice: a genuinely correct fix in a module that imports e.g.
     snowflake-connector-python fails collection with ModuleNotFoundError, reported as a plain
     FAIL indistinguishable from a real logic bug. Flag that distinction rather than silently
-    letting a tooling gap look like a code defect -- does not fix the gap, only labels it."""
-    if result["passed"] or "ModuleNotFoundError" not in (result.get("stdout", "") + result.get("stderr", "")):
+    letting a tooling gap look like a code defect -- does not fix the gap, only labels it.
+    """
+    if result["passed"] or "ModuleNotFoundError" not in (
+        result.get("stdout", "") + result.get("stderr", "")
+    ):
         return result
     return {
         **result,
@@ -415,7 +439,8 @@ def _environment_gap_hint(result: dict) -> dict:
 
 def _databricks_client():
     """Lazy Databricks client -- only constructed when get_repo_mapping is actually called, so a
-    missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither."""
+    missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither.
+    """
     if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
         raise RuntimeError(
             "DATABRICKS_HOST and DATABRICKS_TOKEN must both be set for get_repo_mapping "
@@ -448,9 +473,13 @@ def _execute_sql(client, statement: str, timeout_seconds: int = 90) -> list:
     of being reimplemented (or not) per tool."""
     try:
         resp = client.statement_execution.execute_statement(
-            statement=statement, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="0s"
+            statement=statement,
+            warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID,
+            wait_timeout="0s",
         )
-    except Exception as exc:  # noqa: BLE001 -- DatabricksError, network, etc. all reduce to one verdict
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 -- DatabricksError, network, etc. all reduce to one verdict
         raise RuntimeError(str(exc)) from exc
 
     statement_id = resp.statement_id
@@ -460,7 +489,9 @@ def _execute_sql(client, statement: str, timeout_seconds: int = 90) -> list:
         status = resp.status
         state = status.state.value if status and status.state else None
         if state == "SUCCEEDED":
-            return resp.result.data_array if resp.result and resp.result.data_array else []
+            return (
+                resp.result.data_array if resp.result and resp.result.data_array else []
+            )
         if state in ("FAILED", "CANCELED", "CLOSED"):
             raise RuntimeError(f"Databricks SQL statement failed: {status}")
         if elapsed >= timeout_seconds:
@@ -475,7 +506,9 @@ def _execute_sql(client, statement: str, timeout_seconds: int = 90) -> list:
         try:
             resp = client.statement_execution.get_statement(statement_id)
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"polling statement {statement_id} failed: {exc}") from exc
+            raise RuntimeError(
+                f"polling statement {statement_id} failed: {exc}"
+            ) from exc
 
 
 # Matches a git-clonable URL, optionally with an embedded credential (https://TOKEN@host/... or
@@ -492,7 +525,8 @@ def _find_git_url_in_source(source_content: str) -> Optional[str]:
     confirmed in practice, twice, that this is a real, common pattern, not a hypothetical one.
     Returns the FIRST match with any embedded credential stripped, or None if nothing matches.
     Multiple distinct git operations in one file would only ever return the first -- a caller
-    that cares should inspect source_content itself rather than assume this is exhaustive."""
+    that cares should inspect source_content itself rather than assume this is exhaustive.
+    """
     match = _GIT_URL_PATTERN.search(source_content)
     if not match:
         return None
@@ -549,16 +583,27 @@ def git_create_branch(repo_dir: str, branch: str, base: str = "main") -> dict:
 
     proc = _run_git(["checkout", base], cwd=cwd)
     if proc.returncode != 0:
-        return {"branch": None, "error": f"checkout {base} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"checkout {base} failed: {proc.stderr.strip()}",
+        }
 
     with _git_auth_env() as env:
-        proc = _run_git(["-c", "credential.helper=", "pull", "origin", base], cwd=cwd, env=env)
+        proc = _run_git(
+            ["-c", "credential.helper=", "pull", "origin", base], cwd=cwd, env=env
+        )
     if proc.returncode != 0:
-        return {"branch": None, "error": f"pull origin {base} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"pull origin {base} failed: {proc.stderr.strip()}",
+        }
 
     proc = _run_git(["checkout", "-b", branch], cwd=cwd)
     if proc.returncode != 0:
-        return {"branch": None, "error": f"checkout -b {branch} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"checkout -b {branch} failed: {proc.stderr.strip()}",
+        }
     return {"branch": branch, "error": None}
 
 
@@ -579,9 +624,17 @@ def git_status(repo_dir: str) -> dict:
     branch_proc = _run_git(["branch", "--show-current"], cwd=cwd)
     status_proc = _run_git(["status", "--porcelain"], cwd=cwd)
     if status_proc.returncode != 0:
-        return {"branch": None, "changed_files": [], "error": status_proc.stderr.strip()}
+        return {
+            "branch": None,
+            "changed_files": [],
+            "error": status_proc.stderr.strip(),
+        }
     changed = [line.strip() for line in status_proc.stdout.splitlines() if line.strip()]
-    return {"branch": branch_proc.stdout.strip(), "changed_files": changed, "error": None}
+    return {
+        "branch": branch_proc.stdout.strip(),
+        "changed_files": changed,
+        "error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -676,7 +729,10 @@ def git_cleanup(repo_dir: str) -> dict:
     if not target.exists():
         return {"deleted": True, "error": None}
     if not target.is_dir():
-        return {"deleted": False, "error": f"{target} is not a directory -- refusing to remove"}
+        return {
+            "deleted": False,
+            "error": f"{target} is not a directory -- refusing to remove",
+        }
 
     import shutil
     import stat
@@ -747,8 +803,15 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         try:
             proc = _run(tool_args, cwd=cwd)
         except FileNotFoundError as exc:
-            results.append({"tool": label, "passed": False, "returncode": None,
-                             "stdout": "", "stderr": f"not installed/found: {exc}"})
+            results.append(
+                {
+                    "tool": label,
+                    "passed": False,
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": f"not installed/found: {exc}",
+                }
+            )
             continue
         results.append(_tool_result(label, proc))
 
@@ -758,13 +821,30 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         if candidate.exists():
             try:
                 proc = _run(
-                    ["pytest", str(candidate.relative_to(cwd)), "-m", "not integration", "-v"],
+                    [
+                        "pytest",
+                        str(candidate.relative_to(cwd)),
+                        "-m",
+                        "not integration",
+                        "-v",
+                    ],
                     cwd=cwd,
                 )
-                results.append(_environment_gap_hint(_tool_result(f"pytest:{candidate.name}", proc)))
+                results.append(
+                    _environment_gap_hint(
+                        _tool_result(f"pytest:{candidate.name}", proc)
+                    )
+                )
             except FileNotFoundError as exc:
-                results.append({"tool": f"pytest:{candidate.name}", "passed": False,
-                                 "returncode": None, "stdout": "", "stderr": str(exc)})
+                results.append(
+                    {
+                        "tool": f"pytest:{candidate.name}",
+                        "passed": False,
+                        "returncode": None,
+                        "stdout": "",
+                        "stderr": str(exc),
+                    }
+                )
 
     return {
         "checked": py_files,
@@ -794,12 +874,14 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
         proc = _run(["pytest", test_path, "-m", markers, "-v"], cwd=cwd)
     except FileNotFoundError as exc:
         return {"passed": False, "stdout": "", "stderr": str(exc), "returncode": None}
-    return _environment_gap_hint({
-        "passed": proc.returncode == 0,
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-    })
+    return _environment_gap_hint(
+        {
+            "passed": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +890,9 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
 
 
 @mcp.tool()
-def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "") -> dict:
+def get_repo_mapping(
+    source_path: str, job_id: str = "", source_content: str = ""
+) -> dict:
     """
     Resolve a Databricks task's source_path to the git repo it actually lives in, trying three
     mechanisms in order:
@@ -880,7 +964,7 @@ def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "
                 "source_path": source_path,
                 "repo_url": getattr(found_repo, "url", None),
                 "repo_path_in_workspace": repo_path,
-                "relative_path_in_repo": source_path[len(repo_path):].lstrip("/"),
+                "relative_path_in_repo": source_path[len(repo_path) :].lstrip("/"),
                 "branch": getattr(found_repo, "branch", None),
                 "provider": (str(getattr(found_repo, "provider", "")) or None),
                 "resolution_method": "databricks_repos",
@@ -1015,7 +1099,9 @@ def create_pr(repo: str, branch: str, base: str, title: str, body: str) -> dict:
         gh_repo = gh.get_repo(repo)
         pr = gh_repo.create_pull(title=title, body=body, head=branch, base=base)
         return {"pr_number": pr.number, "pr_url": pr.html_url, "error": None}
-    except Exception as exc:  # noqa: BLE001 - PyGithub raises its own exception hierarchy; a
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - PyGithub raises its own exception hierarchy; a
         # clean {"error": ...} beats a caller having to catch a library-specific exception type
         return {"pr_number": None, "pr_url": None, "error": str(exc)}
 
@@ -1062,10 +1148,13 @@ _STAGE_HEADERS = {
 }
 
 
-def _incident_summary_blocks(incident: dict, stage: str = "", message: str = "") -> list:
+def _incident_summary_blocks(
+    incident: dict, stage: str = "", message: str = ""
+) -> list:
     header_text = _STAGE_HEADERS.get(stage, "opsbuddy-fix incident summary")
     fields = [
-        {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"} for key, value in incident.items()
+        {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"}
+        for key, value in incident.items()
     ]
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": header_text}},
@@ -1158,11 +1247,23 @@ def post_slack_alert(
                 timeout=10,
             )
             data = response.json()
-        except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
             return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
         if not data.get("ok"):
-            return {"sent": False, "ts": None, "channel": None, "error": f"Slack API error: {data.get('error')}"}
-        return {"sent": True, "ts": data.get("ts"), "channel": data.get("channel"), "error": None}
+            return {
+                "sent": False,
+                "ts": None,
+                "channel": None,
+                "error": f"Slack API error: {data.get('error')}",
+            }
+        return {
+            "sent": True,
+            "ts": data.get("ts"),
+            "channel": data.get("channel"),
+            "error": None,
+        }
 
     if not SLACK_WEBHOOK_URL:
         return {
@@ -1177,7 +1278,9 @@ def post_slack_alert(
             json={"text": text, "blocks": blocks},
             timeout=10,
         )
-    except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
         return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
     if response.status_code != 200:
         return {
@@ -1230,7 +1333,8 @@ def log_incident(record: dict) -> dict:
     DELTA_INSERT_COLUMN_MISMATCH naming the real column -- if a future table redesign changes
     these names, update this docstring to match rather than guessing from the error alone each
     time. Mirrors python/utils/databricks_conn.py's insert_ops_incident_log exactly (same SQL
-    construction, same `loaded_at` default) so behavior stays identical to the Bash path."""
+    construction, same `loaded_at` default) so behavior stays identical to the Bash path.
+    """
     if not DATABRICKS_SQL_WAREHOUSE_ID:
         return {
             "logged": False,
@@ -1269,7 +1373,8 @@ def read_file(repo_dir: str, path: str) -> dict:
     """Read a text file at `path` (relative to an already-cloned `repo_dir`). For Phase 5 on
     Claude Desktop, which has no file-reading tool of its own -- read the file here, edit its
     content, then pass the whole new content to write_file. Whole-file only; there is no
-    line-range/patch mode. Text files only -- a binary file will fail to decode as UTF-8."""
+    line-range/patch mode. Text files only -- a binary file will fail to decode as UTF-8.
+    """
     try:
         target = _resolve_repo_relative(repo_dir, path)
     except ValueError as exc:
@@ -1291,7 +1396,8 @@ def write_file(repo_dir: str, path: str, content: str) -> dict:
     already-cloned `repo_dir`), overwriting it if it exists or creating it (and any missing
     parent directories) if not. Whole-file only -- always read_file first and edit its content in
     full, rather than guessing at a partial patch. This is a plain file write, not a git
-    operation -- git_status/git_commit still need to be called afterward to stage and commit it."""
+    operation -- git_status/git_commit still need to be called afterward to stage and commit it.
+    """
     try:
         target = _resolve_repo_relative(repo_dir, path)
     except ValueError as exc:
@@ -1317,7 +1423,11 @@ def _pick_failed_task(run):
     tasks = run.tasks or []
     for task in tasks:
         state = task.state
-        if state and state.result_state and state.result_state.value in _FAILED_RESULT_STATES:
+        if (
+            state
+            and state.result_state
+            and state.result_state.value in _FAILED_RESULT_STATES
+        ):
             return task
     return tasks[0] if tasks else None
 
@@ -1356,10 +1466,14 @@ def get_job_run(run_id: str) -> dict:
     task = _pick_failed_task(run)
     error_message, stack_trace = "", ""
     try:
-        output = client.jobs.get_run_output(run_id=(task.run_id if task else run.run_id))
+        output = client.jobs.get_run_output(
+            run_id=(task.run_id if task else run.run_id)
+        )
         error_message = output.error or ""
         stack_trace = output.error_trace or ""
-    except Exception:  # noqa: BLE001 - SDK/network edge cases -- degrade gracefully, same as CLI
+    except (
+        Exception
+    ):  # noqa: BLE001 - SDK/network edge cases -- degrade gracefully, same as CLI
         pass
 
     state = run.state
@@ -1369,9 +1483,13 @@ def get_job_run(run_id: str) -> dict:
         "job_name": run.run_name or "",
         "task_key": task.task_key if task else "",
         "life_cycle_state": (
-            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+            state.life_cycle_state.value
+            if state and state.life_cycle_state
+            else "UNKNOWN"
         ),
-        "result_state": state.result_state.value if state and state.result_state else "-",
+        "result_state": (
+            state.result_state.value if state and state.result_state else "-"
+        ),
         "error_message": error_message,
         "stack_trace": stack_trace,
         "cluster_id": getattr(task, "existing_cluster_id", None) if task else None,
@@ -1399,9 +1517,13 @@ def get_latest_failed_run(job_id: str) -> dict:
     from databricks.sdk.errors import DatabricksError
 
     try:
-        for run in client.jobs.list_runs(job_id=int(job_id), active_only=False, limit=25):
+        for run in client.jobs.list_runs(
+            job_id=int(job_id), active_only=False, limit=25
+        ):
             state = run.state
-            result_state = state.result_state.value if state and state.result_state else None
+            result_state = (
+                state.result_state.value if state and state.result_state else None
+            )
             if result_state in _FAILED_RESULT_STATES:
                 return {"run_id": run.run_id, "error": None}
     except DatabricksError as exc:
@@ -1417,7 +1539,9 @@ def get_latest_failed_run(job_id: str) -> dict:
 
 
 @mcp.tool()
-def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False) -> dict:
+def trigger_job_run(
+    job_id: str, timeout_seconds: int = 600, force: bool = False
+) -> dict:
     """Re-run a persistent Databricks job and block until it reaches a terminal state -- used
     for opsbuddy-fix's Gate 8.5 real-verification step, to prove a fix actually works rather
     than trusting a code review alone. Real production jobs can write real data, so unless
@@ -1451,7 +1575,10 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
     except DatabricksError as exc:
         return {"succeeded": None, "error": str(exc)}
     except (TypeError, ValueError):
-        return {"succeeded": None, "error": f"job_id must be an integer, got {job_id!r}"}
+        return {
+            "succeeded": None,
+            "error": f"job_id must be an integer, got {job_id!r}",
+        }
 
     run_id = run.run_id
     elapsed = 0
@@ -1460,7 +1587,9 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
         run_status = client.jobs.get_run(run_id=run_id)
         state = run_status.state
         life_cycle = (
-            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+            state.life_cycle_state.value
+            if state and state.life_cycle_state
+            else "UNKNOWN"
         )
         result_state = state.result_state.value if state and state.result_state else "-"
         if life_cycle in _TERMINAL_LIFE_CYCLE_STATES:
@@ -1491,7 +1620,9 @@ def _job_name(client, job_id) -> str:
     bare ID -- never worth failing the whole lineage call over."""
     try:
         job = client.jobs.get(job_id=int(job_id))
-        return job.settings.name if job.settings and job.settings.name else f"job {job_id}"
+        return (
+            job.settings.name if job.settings and job.settings.name else f"job {job_id}"
+        )
     except Exception:  # noqa: BLE001
         return f"job {job_id}"
 
@@ -1551,13 +1682,11 @@ def get_table_lineage(run_id: str) -> dict:
         return _execute_sql(client, statement)
 
     try:
-        rows = run_query(
-            f"""
+        rows = run_query(f"""
             SELECT DISTINCT source_table_full_name, target_table_full_name
             FROM system.access.table_lineage
             WHERE entity_type = 'JOB' AND entity_run_id = '{run_id}'
-            """
-        )
+            """)
     except RuntimeError as exc:
         return {**empty, "error": f"table_lineage query failed: {exc}"}
 
@@ -1572,27 +1701,31 @@ def get_table_lineage(run_id: str) -> dict:
             return [], None
         in_clause = ", ".join(f"'{t}'" for t in tables)
         try:
-            rows = run_query(
-                f"""
+            rows = run_query(f"""
                 SELECT DISTINCT entity_type, entity_id
                 FROM system.access.table_lineage
                 WHERE {column} IN ({in_clause})
                   AND entity_run_id != '{run_id}'
-                """
-            )
+                """)
         except RuntimeError as exc:
             return [], str(exc)
         entities = [
             {
                 "type": (entity_type or "unknown").lower(),
-                "name": _job_name(client, entity_id) if entity_type == "JOB" else str(entity_id),
+                "name": (
+                    _job_name(client, entity_id)
+                    if entity_type == "JOB"
+                    else str(entity_id)
+                ),
                 "id": str(entity_id),
             }
             for entity_type, entity_id in rows
         ]
         return entities, None
 
-    upstream_producers, upstream_error = neighbor_entities(tables_read, "target_table_full_name")
+    upstream_producers, upstream_error = neighbor_entities(
+        tables_read, "target_table_full_name"
+    )
     if upstream_error:
         return {
             "tables_read": tables_read,
@@ -1602,7 +1735,9 @@ def get_table_lineage(run_id: str) -> dict:
             "error": f"upstream producer lookup failed (tables read/written above are still valid): {upstream_error}",
         }
 
-    downstream_consumers, downstream_error = neighbor_entities(tables_written, "source_table_full_name")
+    downstream_consumers, downstream_error = neighbor_entities(
+        tables_written, "source_table_full_name"
+    )
     if downstream_error:
         return {
             "tables_read": tables_read,
@@ -1627,7 +1762,9 @@ def get_table_lineage(run_id: str) -> dict:
 
 
 @mcp.tool()
-def get_incident_history(job_id: str = "", error_category: str = "", days: int = 30) -> dict:
+def get_incident_history(
+    job_id: str = "", error_category: str = "", days: int = 30
+) -> dict:
     """Look up past incidents from the Databricks ops incident-log table
     (DATABRICKS_OPS_INCIDENT_TABLE, default dev.ops_incidents.incident_log -- the same table
     log_incident writes to). log_incident is insert-only; nothing else here ever reads it back,
@@ -1663,7 +1800,12 @@ def get_incident_history(job_id: str = "", error_category: str = "", days: int =
     bigger than one job) -- not a license to skip re-diagnosing and reapply whatever fixed it
     last time. The code may have changed since; blindly replaying an old patch risks causing a
     different, new incident instead of preventing one."""
-    empty = {"incidents": [], "count": 0, "distinct_jobs_affected": 0, "is_recurring": False}
+    empty = {
+        "incidents": [],
+        "count": 0,
+        "distinct_jobs_affected": 0,
+        "is_recurring": False,
+    }
     if not job_id and not error_category:
         return {
             **empty,
@@ -1744,7 +1886,7 @@ def _run_http() -> None:
         print(
             "FATAL: MCP_TRANSPORT=http requires MCP_API_KEY to be set.\n"
             "  export MCP_API_KEY=<a long random string>\n"
-            "  (generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\")",
+            '  (generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))")',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1777,6 +1919,8 @@ if __name__ == "__main__":
     elif MCP_TRANSPORT in ("http", "streamable-http"):
         _run_http()
     else:
-        print(f"FATAL: unknown MCP_TRANSPORT={MCP_TRANSPORT!r} (expected 'stdio' or 'http')",
-              file=sys.stderr)
+        print(
+            f"FATAL: unknown MCP_TRANSPORT={MCP_TRANSPORT!r} (expected 'stdio' or 'http')",
+            file=sys.stderr,
+        )
         sys.exit(1)

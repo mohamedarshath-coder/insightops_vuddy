@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntactic-checks:
+    name: Syntactic checks (JSON, YAML frontmatter, py_compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyYAML (frontmatter check only -- not a server.py dependency)
+        run: pip install pyyaml
+
+      - name: Validate JSON configs
+        run: |
+          python - <<'PY'
+          import json
+
+          for path in [
+              ".claude-plugin/marketplace.json",
+              "plugins/insightops-buddy/.claude-plugin/plugin.json",
+              "plugins/insightops-buddy/.mcp.json",
+          ]:
+              with open(path, encoding="utf-8") as f:
+                  json.load(f)
+              print(f"{path}: OK")
+          PY
+
+      - name: Validate SKILL.md YAML frontmatter
+        run: |
+          python - <<'PY'
+          import glob
+
+          import yaml
+
+          paths = sorted(glob.glob("plugins/insightops-buddy/skills/*/SKILL.md"))
+          if not paths:
+              raise SystemExit("no SKILL.md files found -- glob pattern may be stale")
+
+          for path in paths:
+              with open(path, encoding="utf-8") as f:
+                  text = f.read()
+              if not text.startswith("---\n"):
+                  raise SystemExit(f"{path}: missing opening '---' frontmatter delimiter")
+              end = text.find("\n---\n", 4)
+              if end == -1:
+                  raise SystemExit(f"{path}: missing closing '---' frontmatter delimiter")
+              data = yaml.safe_load(text[4:end])
+              for required in ("name", "description"):
+                  if required not in data:
+                      raise SystemExit(f"{path}: frontmatter missing required '{required}' field")
+              print(f"{path}: OK")
+          PY
+
+      - name: py_compile server.py
+        run: python -m py_compile plugins/insightops-buddy/mcp-server/server.py
+
+  semantic-checks:
+    name: Semantic checks (flake8, black, isort, smoke test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugins/insightops-buddy/mcp-server
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: flake8
+        # E203 (whitespace before ':') is black's own deliberate slice-notation style, not a
+        # real issue -- flake8's default rule predates black and the two disagree on this one
+        # case by design; ignoring it is black's own documented recommendation, not a local
+        # exception carved out for this file.
+        run: uv run flake8 --max-line-length=120 --extend-ignore=E203 server.py
+
+      - name: black --check
+        run: uv run black --check server.py
+
+      - name: isort --check
+        run: uv run isort --check server.py
+
+      - name: Smoke test -- server actually starts
+        # py_compile only proves the file parses; this proves it runs -- catches a broken
+        # module-level reference or missing import that's valid syntax but fails at execution.
+        # server.py needs zero env vars to start (every Databricks/GitHub/Slack credential is
+        # read lazily, only when the tool that needs it is actually called).
+        run: |
+          timeout 10 uv run server.py > smoke.log 2>&1 &
+          pid=$!
+          sleep 5
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "server.py exited unexpectedly:"
+            cat smoke.log
+            exit 1
+          fi
+          kill "$pid"
+          if ! grep -q "opsbuddy-git-ops workdir:" smoke.log; then
+            echo "server.py started but never printed its startup banner:"
+            cat smoke.log
+            exit 1
+          fi
+          echo "Smoke test OK -- server started and printed its workdir banner"
