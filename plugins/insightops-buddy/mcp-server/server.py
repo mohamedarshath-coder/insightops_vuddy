@@ -656,9 +656,18 @@ def git_cleanup(repo_dir: str) -> dict:
 
     Returns {"deleted": True, "error": None} on success, {"deleted": False, "error": "..."} if
     repo_dir doesn't resolve under the workdir, doesn't exist (already gone -- not itself an
-    error worth failing over, see below), or couldn't be removed (e.g. a file still open/locked
-    on Windows). A repo_dir that's already gone returns {"deleted": True, "error": None} too --
-    the end state ("this path has no repo checkout") is what's being asked for either way."""
+    error worth failing over, see below), or still couldn't be removed after retrying (see
+    below). A repo_dir that's already gone returns {"deleted": True, "error": None} too -- the
+    end state ("this path has no repo checkout") is what's being asked for either way.
+
+    Confirmed in practice on Windows: a plain shutil.rmtree() reliably fails on git's own
+    .git/objects files, which git marks read-only -- not a transient lock, a permission bit that
+    needs clearing before delete will ever succeed no matter how many times it's retried as-is.
+    Handled via an onerror hook that clears the read-only bit and retries that one file. Separately,
+    something else can also transiently hold a handle open (antivirus scanning a just-written
+    file, a lingering process) -- covered with a few retries with a short pause between them
+    before finally giving up and reporting the real error, rather than leaving the caller to
+    guess whether "failed" means "permanently can't" or "try again in a second"."""
     try:
         target = _resolve_under_workdir(repo_dir)
     except ValueError as exc:
@@ -670,12 +679,34 @@ def git_cleanup(repo_dir: str) -> dict:
         return {"deleted": False, "error": f"{target} is not a directory -- refusing to remove"}
 
     import shutil
+    import stat
 
-    try:
-        shutil.rmtree(target)
-    except OSError as exc:
-        return {"deleted": False, "error": f"failed to remove {target}: {exc}"}
-    return {"deleted": True, "error": None}
+    def _clear_readonly_and_retry(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass  # let the retry loop below observe and report the final state
+
+    last_exc = None
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(target, onerror=_clear_readonly_and_retry)
+        except OSError as exc:
+            last_exc = exc
+        if not target.exists():
+            return {"deleted": True, "error": None}
+        if attempt < attempts - 1:
+            time.sleep(0.5)
+
+    return {
+        "deleted": False,
+        "error": (
+            f"failed to remove {target} after {attempts} attempts: "
+            f"{last_exc if last_exc is not None else 'files still present, likely locked by another process'}"
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
