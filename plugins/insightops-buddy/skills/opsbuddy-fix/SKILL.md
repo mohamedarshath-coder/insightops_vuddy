@@ -237,6 +237,29 @@ since, and blindly replaying an old patch risks causing a different, new inciden
 preventing one. Same fail-soft treatment as lineage: if it errors (not configured, query failed),
 note history as "unavailable" and continue — this must never block or delay diagnosis.
 
+**If a past incident for this job is found and already resolved, pull its fix as reference
+material for Phase 2 (not a shortcut):**
+```
+# via whatever GitHub MCP server is connected (native `github` connector, if available) -- exact
+# tool name varies by server (`get_pull_request_diff`, `get_pull_request_files`, etc.), same
+# "varies by server" caveat as Phase 8's CI status lookup below
+
+# Bash fallback
+gh pr diff <pr_number> --repo <owner/repo>
+```
+Only do this when the most recent matching incident's `execution_status` indicates it actually
+resolved (e.g. `Done`) and `pr_url` is present — an incident that's still open or was abandoned
+has no fix worth referencing. Hand the diff to both Phase 2 diagnosis agents as **reference
+material only**, explicitly labeled as such -- e.g. "a past incident on this job with the same
+error category was fixed by the attached diff; this may or may not still apply, diagnose the
+current code independently and only note the similarity if it genuinely explains the current
+failure." **This must never replace Phase 2's actual diagnosis of the current code** — same
+reasoning as the `is_recurring` guardrail above: the code may have changed since, the past fix
+may no longer be relevant, and pattern-matching to an old diff risks proposing a fix that doesn't
+address what's actually broken now. If the diff can't be fetched (no suitable tool connected, the
+PR's branch was since deleted, etc.), skip this silently — enrichment, not a prerequisite, same
+fail-soft treatment as everything else in this phase.
+
 **After Phase 2 assigns `ERROR_CATEGORY`, also check whether it's showing up platform-wide:**
 ```
 # MCP-preferred (this plugin's own opsbuddy-git-ops)
@@ -260,7 +283,9 @@ Timeout/Startup Failure, Dependency/Library Import Error, Data Skew/Partition Ex
 Upstream Task Dependency Failure, Infrastructure/Cloud Provider Error) and spawns **two
 independent** `root-cause-analysis` (Cat L) agent instances — each given the real source content
 fetched via GitHub (see Phase 4's repo resolution; do this lookup early enough to hand real
-source to both agents, not just the error message) — reconciling them into one verdict:
+source to both agents, not just the error message) and, when Phase 1 found one, a past resolved
+incident's diff as reference-only material (see Phase 1 — never a substitute for diagnosing the
+current code) — reconciling them into one verdict:
 ```
 ERROR_CATEGORY: <one of the 11 standardized categories>
 ROOT_CAUSE_SUMMARY: <2-4 sentences>
@@ -346,6 +371,20 @@ configured, same reasoning as Data lineage above)
 also affected N other job(s) in the last 30 days: <job ids>, suggesting a platform-wide cause
 rather than something isolated to this job.">
 (omit this line entirely if distinct_jobs_affected <= 1 -- no need to state a negative)
+
+### Business impact
+<if downstream_consumers is non-empty: "This failure blocks N downstream table(s)/consumer(s)
+from refreshing: <downstream_consumers, name + type per line>.">
+<if is_recurring or distinct_jobs_affected > 1: one plain-language line combining whichever
+applies -- e.g. "This is the Nth failure for this job in the last 30 days" and/or "part of a
+platform-wide pattern affecting M jobs" -- phrased for a reader deciding how urgently to act, not
+a restatement of the Incident history section's exact wording>
+(omit this whole section if there's nothing to report -- no downstream consumers found AND not
+recurring/platform-wide -- rather than printing an empty or all-negative section. This section is
+purely a synthesis of data already gathered above in Data lineage and Incident history, not new
+data collection, and not a severity/priority judgment the skill makes on its own -- it exists so
+a non-technical reader doesn't have to piece the business consequence together themselves from
+the more technical sections above it.)
 
 ### Error
 ```
