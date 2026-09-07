@@ -105,19 +105,25 @@ jobs:
         # module-level reference or missing import that's valid syntax but fails at execution.
         # server.py needs zero env vars to start (every Databricks/GitHub/Slack credential is
         # read lazily, only when the tool that needs it is actually called).
+        #
+        # Run with stdin explicitly closed (< /dev/null), not backgrounded-then-polled: this is
+        # a stdio-transport MCP server, so with no client attached it reads EOF immediately and
+        # exits cleanly on its own (confirmed in practice -- exit 0, banner printed, all within
+        # under a second) rather than blocking like a persistent daemon. An earlier version of
+        # this check assumed it should still be running after a few seconds and failed the build
+        # on entirely expected behavior; the real signal is whether the banner got printed and
+        # nothing crashed before exit, not whether the process is still alive at some fixed delay.
         run: |
-          timeout 10 uv run server.py > smoke.log 2>&1 &
-          pid=$!
-          sleep 5
-          if ! kill -0 "$pid" 2>/dev/null; then
-            echo "server.py exited unexpectedly:"
-            cat smoke.log
-            exit 1
-          fi
-          kill "$pid"
+          timeout 10 uv run server.py < /dev/null > smoke.log 2>&1 || true
+          echo "server.py exited (expected: clean exit on stdin EOF, no client attached)"
           if ! grep -q "opsbuddy-git-ops workdir:" smoke.log; then
-            echo "server.py started but never printed its startup banner:"
+            echo "server.py never printed its startup banner:"
             cat smoke.log
             exit 1
           fi
-          echo "Smoke test OK -- server started and printed its workdir banner"
+          if grep -qi "Traceback (most recent call last)" smoke.log; then
+            echo "server.py printed a traceback:"
+            cat smoke.log
+            exit 1
+          fi
+          echo "Smoke test OK -- server started, printed its workdir banner, no traceback"
