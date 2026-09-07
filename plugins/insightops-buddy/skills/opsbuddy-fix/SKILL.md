@@ -332,12 +332,24 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py create --project <project
   --description "<run metadata + full diagnostics -- standard Markdown>" --priority High --label opsbuddy-fix
 ```
 **Description format — standard Markdown only, never Jira wiki markup.** The Atlassian
-connector's `description` renders CommonMark Markdown (`##`/`###` headings, triple-backtick code
-fences, `**bold**`) and converts it to ADF itself — it does **not** render Jira/Confluence wiki
-markup (`h3.` headings, `{code}...{code}` blocks, `{quote}`). Confirmed in practice: a real run
-used wiki markup here and it came out as literal, unrendered text (`h3. Root cause` printed as a
-plain line, not a heading) — easy mistake since wiki markup is what a human typing directly into
-Jira's own editor would use, but this call doesn't go through that editor. Use exactly this shape:
+connector's `description` renders CommonMark Markdown and converts it to ADF itself — it does
+**not** render Jira/Confluence wiki markup. Confirmed wrong **twice** in practice on real runs,
+the second time despite this exact warning already being here — so before writing the
+description, check every heading/code block/inline-code span against this table, character by
+character, not from memory:
+
+| Never write (wiki markup) | Always write (Markdown) |
+|---|---|
+| `h2. Root cause` | `## Root cause` or `### Root cause` |
+| `{code}...{code}` | ```` ```...``` ```` (triple backtick fence) |
+| `{{inline code}}` | `` `inline code` `` (single backtick) |
+| `{quote}...{quote}` | `> quoted text` |
+
+Both confirmed failures looked identical: the description posted successfully with no error, and
+only *looked* wrong once opened in Jira's own UI — `h2. Root cause` renders as the literal plain
+text "h2. Root cause", not a heading. There's no error to catch this; it has to be gotten right
+the first time by matching the table above, not by writing what looks natural for a Jira ticket.
+Use exactly this shape:
 
 ```markdown
 ### Run details
@@ -355,9 +367,10 @@ Downstream consumers: <downstream_consumers -- name + type per line, or "none fo
 (if upstream_producers names a job other than this one, add one line here: "Possible upstream
 root cause: <job name> produced <table>" -- a lead for the human, not a conclusion this skill
 draws on its own)
-(omit this whole section if Phase 1's get_table_lineage call errored or wasn't configured --
-say "unavailable" in one line instead of leaving it out silently, so a reader knows it was
-checked and just couldn't be retrieved, not that no one thought to check)
+(**never omit this section header.** If Phase 1's get_table_lineage call errored or wasn't
+configured, replace the four lines above with a single line: "unavailable" -- so a reader sees
+the section was checked and just couldn't be retrieved, not that no one thought to check. The
+section header always appears; only its content ever changes.)
 
 ### Incident history
 <if get_incident_history(job_id=...)'s count is 0: "No prior incidents found for this job in the
@@ -365,8 +378,8 @@ last 30 days.">
 <if count >= 1: "This job has failed N time(s) in the last 30 days. Most recent: <jira_ticket_id>
 (<execution_status>, <error_category>, detected <detected_at>)." -- and if is_recurring, add:
 "This is a recurring failure — the previous fix may not have fully resolved it.">
-(say "unavailable" in one line instead of omitting the section if the call errored or wasn't
-configured, same reasoning as Data lineage above)
+(**never omit this section header** -- same rule as Data lineage above: replace the content with
+"unavailable" if the call errored or wasn't configured, never delete the section itself)
 <if get_incident_history(error_category=...)'s distinct_jobs_affected > 1: "<ERROR_CATEGORY> has
 also affected N other job(s) in the last 30 days: <job ids>, suggesting a platform-wide cause
 rather than something isolated to this job.">
@@ -405,6 +418,16 @@ ERROR_CATEGORY: <category>
 CODE_FIX_POSSIBLE: <true/false> (<confidence note>)
 ```
 
+**Before calling `createJiraIssue`, check the description you've built actually has all of:**
+Run details, Data lineage, Incident history, Error, Root cause, Affected files, Suggested fix —
+plus Business impact if that section applies. Every one of these except Business impact must be
+present in some form (real content or "unavailable") even when the run is about to halt at Gate
+3.5 with no code fix — a ticket that's short on information is exactly the case where a human
+needs *more* context to act on it manually, not less. Confirmed in practice: a real run wrote a
+complete, well-formed ticket that was still missing Data lineage, Incident history, and Business
+impact entirely — not "unavailable," just absent, as if Phase 1 had never run. Treat a
+half-populated ticket as a bug to fix before sending, not a shortcut under time pressure.
+
 (`create` automatically falls back to whatever issue type the project actually has — Incident >
 Bug > Task > Story — if the requested type doesn't exist.) Populate with job/run ID, error
 category, root cause summary, stack trace excerpt, affected files, and — if Phase 2 found a
@@ -426,6 +449,16 @@ mcp__claude_ai_Atlassian__transitionJiraIssue(cloudId="<cloudId>", issueIdOrKey=
 # list if nothing matches -- never hardcodes a transition name blind)
 python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "In Progress"
 ```
+**If no available transition's name literally contains "in progress"/"doing"/"start"**, fall back
+to matching by the transition's underlying status *category* instead (Jira Cloud issues expose
+this even when a project's actual status names are custom) — but if the transition you land on
+this way has a name that could read as misleading out of context (confirmed in practice: a real
+project's only "in progress"-category status was named "In Review," which implies a PR is
+waiting when one may not exist yet), say so explicitly in whatever comment you next post to this
+ticket -- e.g. "Note: this board's 'in progress' status is named 'In Review' -- no PR exists yet/
+at all for this ticket, despite the column name." A ticket sitting in a column called "In Review"
+with nothing to review is exactly the kind of thing that confuses whoever's triaging the board
+later if it isn't called out where they'll actually see it.
 
 **Slack alert 1/5 — incident detected.** This is the one checkpoint that carries prose, not just
 fields: put the plain-English root cause (from Phase 2's reconciled verdict) in `message` so the
@@ -463,8 +496,23 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
   # Bash fallback
   python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment <TICKET-KEY> "<explanation>"
   ```
-  — send the Phase 10 Slack alert with `EXECUTION_STATUS=MANUAL_ACTION_REQUIRED`, write the
-  Databricks incident row, jump to Phase 11.
+  then **do not skip straight to a summary** — a halt is not an early exit from the phases below,
+  it's a different value for `EXECUTION_STATUS` flowing through the exact same ones every other
+  outcome goes through. Concretely, still do all three of:
+  1. Phase 10's **Slack alert 5/5** (`stage="resolved"`, `EXECUTION_STATUS=MANUAL_ACTION_REQUIRED`,
+     `message` explaining the halt in one line) — not a different, improvised alert, the same
+     fifth checkpoint every run ends on; skipping it is exactly how a halted incident goes out
+     without anyone in the channel ever being told it's stuck.
+  2. Phase 10's Databricks incident-log row (`execution_status: "MANUAL_ACTION_REQUIRED"`,
+     `resolved_at` omitted since nothing resolved).
+  3. Phase 10.5's Confluence postmortem — a halted incident is exactly the kind of thing worth a
+     postmortem page (documents *why* it's stuck for whoever picks up the manual action later),
+     not something this phase only applies to a clean success.
+  Only *then* move to Phase 11's halt-summary format. Confirmed in practice: an early Desktop run
+  wrote the halt comment above, then jumped straight to a final report of its own shape — Slack
+  5/5 and the Confluence page never fired, and the gap wasn't visible until someone went looking
+  for a fifth Slack message that didn't exist. Treat that as the failure mode this note exists to
+  prevent, not a hypothetical.
 
 ## Phase 4 — Git Setup
 
