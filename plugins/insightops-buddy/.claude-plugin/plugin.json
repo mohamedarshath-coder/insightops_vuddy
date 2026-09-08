@@ -1,7 +1,7 @@
 {
   "name": "insightops-buddy",
   "description": "Autonomous, end-to-end incident response for a failed Databricks production job run -- diagnose (checking prior incident history both for this job and platform-wide by error category, and referencing a similar past incident's actual fix diff where one exists, never as a substitute for diagnosing the current code), ticket (full Kanban lifecycle, with two-way data lineage and a plain-language business-impact summary alongside the technical detail), fix, PR, review (with CI status surfaced at the merge gate), verify, alert (one threaded 5-stage Slack timeline, tagged with the job ID at every stage), publish a Confluence postmortem, and clean up its own isolated clone afterward, across 11 phases plus Confluence. A halt (no safe automated fix) still completes the same Slack/Confluence/ticket steps a resolution does, not a shortened exit.",
-  "version": "1.7.2",
+  "version": "1.7.3",
   "author": {
     "name": "mohamedarshath-coder"
   }

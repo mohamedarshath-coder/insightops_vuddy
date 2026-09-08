@@ -612,8 +612,10 @@ earlier Desktop run diagnosed the fix correctly and got as far as creating the h
 had no way to actually write the one-line change and had to halt and hand off to a human.)
 
 Then invoke the **testing** sub-skill for static verification (one bounded retry on failure). If it
-still fails: stop, post a Jira comment, send the Phase 10 Slack alert with
-`EXECUTION_STATUS=REMEDIATION_FAILED`, write the Databricks incident row, jump to Phase 11.
+still fails: stop, post a Jira comment, then complete Phase 10 in full (Slack alert 5/5 with
+`EXECUTION_STATUS=REMEDIATION_FAILED`, the Databricks incident row) **and Phase 10.5's Confluence
+postmortem** before Phase 11's halt summary — same rule as Gate 3.5's halt above: this is a
+different `EXECUTION_STATUS` flowing through every later phase, not a shortcut past them.
 
 ## Phase 6 — Commit & Push
 
@@ -687,8 +689,11 @@ Spawn the **pr-review-opsbuddy-fix** skill (Mode A), passing the repo, PR number
 root-cause verdict. Returns `PASS`/`FAIL` via its 7-point checklist.
 
 - `PASS` → Gate 8.5.
-- `FAIL` → loop back to Phase 5 **once** (bounded retry). Fails again → stop, Jira comment, Phase
-  10 Slack alert with `EXECUTION_STATUS=REVIEW_FAILED`, Databricks incident row, jump to Phase 11.
+- `FAIL` → loop back to Phase 5 **once** (bounded retry). Fails again → stop, Jira comment, then
+  complete Phase 10 in full (Slack alert 5/5 with `EXECUTION_STATUS=REVIEW_FAILED`, the Databricks
+  incident row) **and Phase 10.5's Confluence postmortem** before Phase 11's halt summary — same
+  rule as Gate 3.5's halt above: a different `EXECUTION_STATUS` through every later phase, not a
+  shortcut past them.
 
 ### ⛔ GATE 8.5 — Verify Fix Against a Real Re-Run
 
