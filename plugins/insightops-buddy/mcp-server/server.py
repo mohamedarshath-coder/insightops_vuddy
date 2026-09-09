@@ -15,6 +15,7 @@ Tools:
     git_status(repo_dir)
     git_commit(repo_dir, message, files)
     git_push(repo_dir, branch, remote="origin")
+    git_cleanup(repo_dir)
     run_static_checks(repo_dir, files)
     run_pytest(repo_dir, test_path, markers="not integration")
     get_repo_mapping(source_path, job_id="", source_content="")
@@ -22,11 +23,46 @@ Tools:
     find_open_pr(repo, search_text)
     read_file(repo_dir, path)
     write_file(repo_dir, path, content)
-    post_slack_alert(jira_ticket_id, databricks_run_id, error_category, pr_url, pr_review_verdict, execution_status)
+    post_slack_alert(jira_ticket_id, job_id, databricks_run_id, error_category, pr_url,
+        pr_review_verdict, execution_status, stage, message, thread_ts)
     log_incident(record)
     get_job_run(run_id)
     get_latest_failed_run(job_id)
     trigger_job_run(job_id, timeout_seconds=600, force=False)
+    get_table_lineage(run_id)
+    get_incident_history(job_id="", error_category="", days=30)
+
+git_cleanup is the one and only delete capability on this server, and deliberately narrow --
+same WORKDIR sandbox as every git_*/read_file/write_file tool, nothing else. Closes a real,
+confirmed-in-practice gap: opsbuddy-fix clones a fresh working tree per incident (and again per
+retry), and had no way to remove it afterward, so clones accumulated under the workdir forever.
+Call it once a PR has merged (or the incident's abandoned) and the checkout is no longer needed.
+
+get_incident_history reads back the incident-log table log_incident only ever wrote to --
+without it, every failure gets diagnosed as if it's the first time that job has ever broken,
+even if the exact same job has failed the same way five times before, or a whole error category
+is breaking multiple unrelated jobs at once (job_id can be left empty to query by error_category
+alone, across every job, surfacing that platform-wide shape via distinct_jobs_affected). Read-
+only and diagnostic: a recurring match is a signal to surface (this may be the Nth time, or the
+last fix didn't stick), never a license to skip re-diagnosis and blindly replay an old fix.
+
+All SQL-warehouse-backed tools (log_incident, get_table_lineage, get_incident_history) share one
+execution helper, _execute_sql, that polls instead of blocking on a single long
+execute_statement(wait_timeout=...) call -- confirmed in practice, that blocking pattern caused
+log_incident to time out (indistinguishable, from the caller's side, from the server being
+unresponsive) against a cold-starting SQL warehouse, even though the statement would have
+succeeded once the warehouse woke up 30-60s later.
+
+get_table_lineage is real Unity Catalog data lineage (which tables a run read/wrote, one hop of
+upstream producers of what it read, and one hop of downstream consumers of what it wrote) --
+distinct from get_job_run's "downstream impact", which only ever looks at task state inside one
+job's own DAG, not tables. upstream_producers is what to check when the real root cause might be
+bad data from further back in the pipeline, not a bug in the job that's actually failing. This
+plugin had no data lineage capability at all until this tool was added; the only prior source of
+it (databricks-job-lineage's own get_table_lineage) lived in a plugin this one was deliberately
+built not to depend on, and that version was one-directional (downstream only). Needs
+DATABRICKS_SQL_WAREHOUSE_ID (same var log_incident already uses) plus Unity Catalog lineage
+tracking enabled on the workspace -- see get_table_lineage's own docstring.
 
 get_job_run/get_latest_failed_run/trigger_job_run close the last two Bash-only steps in the whole
 pipeline: Phase 1's telemetry fetch and Gate 8.5's real-verification re-run had no MCP path in
@@ -87,7 +123,7 @@ private repo; SSH remotes need nothing from this server), but REQUIRED for creat
 Run it:
     pip install -r requirements.txt
     export GITHUB_TOKEN=ghp_...        # optional, HTTPS clones/pushes of private repos only
-    export OPSBUDDY_MCP_WORKDIR=D:\opsbuddy\opsbuddy-git-workdir   # optional, see default below
+    export OPSBUDDY_MCP_WORKDIR=D:\\opsbuddy\\opsbuddy-git-workdir   # optional, see default below
     python server.py
 
 Then point an MCP client (Claude Desktop, Claude Code, etc.) at it as a stdio server -- see
@@ -105,6 +141,38 @@ from pathlib import Path
 from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
+
+
+def _load_dotenv(path: str) -> None:
+    """Minimal stdlib-only ".env" loader -- this server is launched via `uv run` (see
+    .mcp.json), which does not auto-load a .env file on its own, and this file never called
+    python-dotenv itself despite an .env.example existing right next to it. Populates
+    os.environ from KEY=VALUE lines in `path` for any key that isn't already set to a real
+    (non-empty) value -- a genuinely-exported var, or one an MCP client's own env block
+    supplies (even as an empty string from an unresolved ${VAR}), still gets filled in from
+    here rather than silently staying blank. Silently does nothing if the file doesn't exist.
+    """
+    if not os.path.isfile(path):
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            # A blank .env line (KEY=, no value -- what .env.example's optional vars look like)
+            # must NOT get set into os.environ at all: several config reads here do
+            # int(os.environ.get(KEY, "300")) and expect a genuinely-missing key to fall through
+            # to that default, not "" (which int() rejects) -- confirmed in practice, this broke
+            # OPSBUDDY_MCP_TIMEOUT_SECONDS the first time this loader ran against the real
+            # .env.example. An already-set real (non-empty) value always wins either way.
+            if value and not os.environ.get(key):
+                os.environ[key] = value
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ---------------------------------------------------------------------------
 # Config
@@ -129,8 +197,14 @@ EXTRA_CA_CERT = (
     or os.environ.get("NODE_EXTRA_CA_CERTS", "").strip()
 )
 
-# Only post_slack_alert needs this -- every other tool works with it unset.
+# Only post_slack_alert needs these -- every other tool works with them unset.
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+# Optional, preferred over the webhook above when both are set: only the Slack Web API's
+# chat.postMessage (bot-token path) can thread a reply under an earlier message, since an
+# incoming webhook has no way to return the posted message's identity for a later call to reply
+# into. Needs a Slack app with a bot token (xoxb-...) invited into SLACK_CHANNEL_ID.
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "").strip()
 
 # Only log_incident needs these -- every other tool works with them unset. The warehouse ID is
 # the same value already used by the databricks-lineage plugin's DATABRICKS_SQL_WAREHOUSE_ID (if
@@ -145,7 +219,9 @@ DATABRICKS_OPS_INCIDENT_TABLE = os.environ.get(
 # keeps a bad or malicious path from writing/deleting outside a known sandbox. Defaults to a
 # folder next to this script so `python server.py` works with zero required config.
 WORKDIR = Path(
-    os.environ.get("OPSBUDDY_MCP_WORKDIR", str(Path(__file__).resolve().parent / "workdir"))
+    os.environ.get(
+        "OPSBUDDY_MCP_WORKDIR", str(Path(__file__).resolve().parent / "workdir")
+    )
 ).resolve()
 WORKDIR.mkdir(parents=True, exist_ok=True)
 
@@ -204,7 +280,8 @@ def _resolve_repo_relative(repo_dir: str, rel_path: str) -> Path:
     land outside that repo's own working tree (a `../` escape) or inside `.git/` (repo internals,
     never a source file a fix should touch). Reuses `_resolve_under_workdir` first so `repo_dir`
     itself still has to be a real, already-existing checkout under the server's sandboxed
-    workdir -- this adds a second, narrower boundary on top of that: the repo root itself."""
+    workdir -- this adds a second, narrower boundary on top of that: the repo root itself.
+    """
     repo = _resolve_under_workdir(repo_dir, must_exist=True)
     candidate = (repo / rel_path).resolve()
     try:
@@ -212,7 +289,9 @@ def _resolve_repo_relative(repo_dir: str, rel_path: str) -> Path:
     except ValueError:
         raise ValueError(f"{rel_path!r} resolves outside repo_dir {repo} -- refusing")
     if relative.parts and relative.parts[0] == ".git":
-        raise ValueError(f"{rel_path!r} is inside .git/ -- refusing to touch repo internals")
+        raise ValueError(
+            f"{rel_path!r} is inside .git/ -- refusing to touch repo internals"
+        )
     return candidate
 
 
@@ -220,11 +299,14 @@ def _kill_process_tree(pid: int) -> None:
     """Best-effort kill of a process AND its children. A plain .kill()/.terminate() only
     signals the immediate process -- git and lint/test tools can spawn helper subprocesses
     that survive that, leaving a "timed out" tool call quietly orphaned in the background
-    forever. `taskkill /T` (Windows) / process-group SIGKILL (POSIX) kills the whole tree."""
+    forever. `taskkill /T` (Windows) / process-group SIGKILL (POSIX) kills the whole tree.
+    """
     try:
         if os.name == "nt":
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=10
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
             )
         else:
             import signal
@@ -234,7 +316,12 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
-def _run(args: List[str], cwd: Path, env: Optional[dict] = None, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+def _run(
+    args: List[str],
+    cwd: Path,
+    env: Optional[dict] = None,
+    timeout: Optional[int] = None,
+) -> subprocess.CompletedProcess:
     """subprocess.run-alike used for every git/lint/test invocation in this server.
 
     Two things a plain `subprocess.run(..., timeout=...)` does NOT reliably give you, both
@@ -266,14 +353,21 @@ def _run(args: List[str], cwd: Path, env: Optional[dict] = None, timeout: Option
         _kill_process_tree(proc.pid)
         try:
             proc.communicate(timeout=10)
-        except Exception:  # noqa: BLE001 - already killed; just reclaim the pipes if possible
+        except (
+            Exception
+        ):  # noqa: BLE001 - already killed; just reclaim the pipes if possible
             pass
         return subprocess.CompletedProcess(
-            args, -1, "", f"timed out after {timeout or SUBPROCESS_TIMEOUT_SECONDS}s and was killed"
+            args,
+            -1,
+            "",
+            f"timed out after {timeout or SUBPROCESS_TIMEOUT_SECONDS}s and was killed",
         )
 
 
-def _run_git(args: List[str], cwd: Path, env: Optional[dict] = None) -> subprocess.CompletedProcess:
+def _run_git(
+    args: List[str], cwd: Path, env: Optional[dict] = None
+) -> subprocess.CompletedProcess:
     return _run(["git", *args], cwd=cwd, env=env)
 
 
@@ -325,8 +419,11 @@ def _environment_gap_hint(result: dict) -> dict:
     confirmed in practice: a genuinely correct fix in a module that imports e.g.
     snowflake-connector-python fails collection with ModuleNotFoundError, reported as a plain
     FAIL indistinguishable from a real logic bug. Flag that distinction rather than silently
-    letting a tooling gap look like a code defect -- does not fix the gap, only labels it."""
-    if result["passed"] or "ModuleNotFoundError" not in (result.get("stdout", "") + result.get("stderr", "")):
+    letting a tooling gap look like a code defect -- does not fix the gap, only labels it.
+    """
+    if result["passed"] or "ModuleNotFoundError" not in (
+        result.get("stdout", "") + result.get("stderr", "")
+    ):
         return result
     return {
         **result,
@@ -342,7 +439,8 @@ def _environment_gap_hint(result: dict) -> dict:
 
 def _databricks_client():
     """Lazy Databricks client -- only constructed when get_repo_mapping is actually called, so a
-    missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither."""
+    missing DATABRICKS_HOST/TOKEN never affects the git/lint tools above, which need neither.
+    """
     if not DATABRICKS_HOST or not DATABRICKS_TOKEN:
         raise RuntimeError(
             "DATABRICKS_HOST and DATABRICKS_TOKEN must both be set for get_repo_mapping "
@@ -351,6 +449,66 @@ def _databricks_client():
     from databricks.sdk import WorkspaceClient
 
     return WorkspaceClient(host=DATABRICKS_HOST, token=DATABRICKS_TOKEN)
+
+
+def _execute_sql(client, statement: str, timeout_seconds: int = 90) -> list:
+    """Run one SQL statement against DATABRICKS_SQL_WAREHOUSE_ID, tolerating a cold-starting
+    warehouse. A stopped/auto-suspended SQL warehouse commonly takes 30-60s+ to wake up --
+    blocking a single execute_statement(wait_timeout=...) call that long risks exceeding the
+    *caller's* own timeout, not just this server's. Confirmed in practice: log_incident timed out
+    this exact way against a stopped warehouse (indistinguishable, from the caller's side, from
+    the server itself being unresponsive) even though the statement would have succeeded once the
+    warehouse finished starting.
+
+    Polls instead of blocking on one call: fires with wait_timeout="0s" (returns immediately in
+    PENDING/RUNNING), then polls get_statement every 2s until a terminal state or
+    `timeout_seconds` total elapses -- so no single API call blocks for more than a couple
+    seconds, no matter how long the whole operation actually takes.
+
+    Returns the result rows (a list, possibly empty) on success. Raises RuntimeError on any
+    failure -- the initial call failing, the statement reaching FAILED/CANCELED/CLOSED, or timing
+    out while still PENDING/RUNNING -- so every caller can use one ordinary `except RuntimeError`,
+    shared by every tool that touches a SQL warehouse (log_incident, get_table_lineage,
+    get_incident_history) so this cold-start tolerance stays identical across all of them instead
+    of being reimplemented (or not) per tool."""
+    try:
+        resp = client.statement_execution.execute_statement(
+            statement=statement,
+            warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID,
+            wait_timeout="0s",
+        )
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 -- DatabricksError, network, etc. all reduce to one verdict
+        raise RuntimeError(str(exc)) from exc
+
+    statement_id = resp.statement_id
+    elapsed = 0
+    poll_interval = 2
+    while True:
+        status = resp.status
+        state = status.state.value if status and status.state else None
+        if state == "SUCCEEDED":
+            return (
+                resp.result.data_array if resp.result and resp.result.data_array else []
+            )
+        if state in ("FAILED", "CANCELED", "CLOSED"):
+            raise RuntimeError(f"Databricks SQL statement failed: {status}")
+        if elapsed >= timeout_seconds:
+            raise RuntimeError(
+                f"Databricks SQL statement did not reach a terminal state within "
+                f"{timeout_seconds}s (state={state!r}, statement_id={statement_id}) -- the "
+                f"warehouse may still be starting; the statement itself may still complete on "
+                f"the Databricks side even though this call gave up waiting for it."
+            )
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+        try:
+            resp = client.statement_execution.get_statement(statement_id)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"polling statement {statement_id} failed: {exc}"
+            ) from exc
 
 
 # Matches a git-clonable URL, optionally with an embedded credential (https://TOKEN@host/... or
@@ -367,7 +525,8 @@ def _find_git_url_in_source(source_content: str) -> Optional[str]:
     confirmed in practice, twice, that this is a real, common pattern, not a hypothetical one.
     Returns the FIRST match with any embedded credential stripped, or None if nothing matches.
     Multiple distinct git operations in one file would only ever return the first -- a caller
-    that cares should inspect source_content itself rather than assume this is exhaustive."""
+    that cares should inspect source_content itself rather than assume this is exhaustive.
+    """
     match = _GIT_URL_PATTERN.search(source_content)
     if not match:
         return None
@@ -424,16 +583,27 @@ def git_create_branch(repo_dir: str, branch: str, base: str = "main") -> dict:
 
     proc = _run_git(["checkout", base], cwd=cwd)
     if proc.returncode != 0:
-        return {"branch": None, "error": f"checkout {base} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"checkout {base} failed: {proc.stderr.strip()}",
+        }
 
     with _git_auth_env() as env:
-        proc = _run_git(["-c", "credential.helper=", "pull", "origin", base], cwd=cwd, env=env)
+        proc = _run_git(
+            ["-c", "credential.helper=", "pull", "origin", base], cwd=cwd, env=env
+        )
     if proc.returncode != 0:
-        return {"branch": None, "error": f"pull origin {base} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"pull origin {base} failed: {proc.stderr.strip()}",
+        }
 
     proc = _run_git(["checkout", "-b", branch], cwd=cwd)
     if proc.returncode != 0:
-        return {"branch": None, "error": f"checkout -b {branch} failed: {proc.stderr.strip()}"}
+        return {
+            "branch": None,
+            "error": f"checkout -b {branch} failed: {proc.stderr.strip()}",
+        }
     return {"branch": branch, "error": None}
 
 
@@ -454,9 +624,17 @@ def git_status(repo_dir: str) -> dict:
     branch_proc = _run_git(["branch", "--show-current"], cwd=cwd)
     status_proc = _run_git(["status", "--porcelain"], cwd=cwd)
     if status_proc.returncode != 0:
-        return {"branch": None, "changed_files": [], "error": status_proc.stderr.strip()}
+        return {
+            "branch": None,
+            "changed_files": [],
+            "error": status_proc.stderr.strip(),
+        }
     changed = [line.strip() for line in status_proc.stdout.splitlines() if line.strip()]
-    return {"branch": branch_proc.stdout.strip(), "changed_files": changed, "error": None}
+    return {
+        "branch": branch_proc.stdout.strip(),
+        "changed_files": changed,
+        "error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +687,85 @@ def git_push(repo_dir: str, branch: str, remote: str = "origin") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# 5b. git_cleanup
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def git_cleanup(repo_dir: str) -> dict:
+    """Delete a cloned repo's working directory. Deliberately the *only* delete capability on
+    this server, and deliberately narrow: `_resolve_under_workdir` still applies, so this can
+    only ever remove something under OPSBUDDY_MCP_WORKDIR (the same sandbox every other git_*/
+    read_file/write_file tool is confined to) -- it cannot be pointed at anything else on disk,
+    no matter what path is passed.
+
+    Confirmed in practice this was a real, growing gap: opsbuddy-fix clones a fresh working tree
+    per incident (and again per retry -- SCRUM-84 alone left two: SCRUM-84 and SCRUM-84-retry)
+    and this server had no way to remove them afterward, so they accumulate under the workdir
+    indefinitely across every incident this pipeline ever handles. Call this once a PR has
+    merged (or the incident is otherwise closed/abandoned) and the local clone is no longer
+    needed -- not before, since a later phase (or Gate 8.5's retry) may still need to read or
+    write from it.
+
+    Returns {"deleted": True, "error": None} on success, {"deleted": False, "error": "..."} if
+    repo_dir doesn't resolve under the workdir, doesn't exist (already gone -- not itself an
+    error worth failing over, see below), or still couldn't be removed after retrying (see
+    below). A repo_dir that's already gone returns {"deleted": True, "error": None} too -- the
+    end state ("this path has no repo checkout") is what's being asked for either way.
+
+    Confirmed in practice on Windows: a plain shutil.rmtree() reliably fails on git's own
+    .git/objects files, which git marks read-only -- not a transient lock, a permission bit that
+    needs clearing before delete will ever succeed no matter how many times it's retried as-is.
+    Handled via an onerror hook that clears the read-only bit and retries that one file. Separately,
+    something else can also transiently hold a handle open (antivirus scanning a just-written
+    file, a lingering process) -- covered with a few retries with a short pause between them
+    before finally giving up and reporting the real error, rather than leaving the caller to
+    guess whether "failed" means "permanently can't" or "try again in a second"."""
+    try:
+        target = _resolve_under_workdir(repo_dir)
+    except ValueError as exc:
+        return {"deleted": False, "error": str(exc)}
+
+    if not target.exists():
+        return {"deleted": True, "error": None}
+    if not target.is_dir():
+        return {
+            "deleted": False,
+            "error": f"{target} is not a directory -- refusing to remove",
+        }
+
+    import shutil
+    import stat
+
+    def _clear_readonly_and_retry(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass  # let the retry loop below observe and report the final state
+
+    last_exc = None
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(target, onerror=_clear_readonly_and_retry)
+        except OSError as exc:
+            last_exc = exc
+        if not target.exists():
+            return {"deleted": True, "error": None}
+        if attempt < attempts - 1:
+            time.sleep(0.5)
+
+    return {
+        "deleted": False,
+        "error": (
+            f"failed to remove {target} after {attempts} attempts: "
+            f"{last_exc if last_exc is not None else 'files still present, likely locked by another process'}"
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 6. run_static_checks
 # ---------------------------------------------------------------------------
 
@@ -546,8 +803,15 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         try:
             proc = _run(tool_args, cwd=cwd)
         except FileNotFoundError as exc:
-            results.append({"tool": label, "passed": False, "returncode": None,
-                             "stdout": "", "stderr": f"not installed/found: {exc}"})
+            results.append(
+                {
+                    "tool": label,
+                    "passed": False,
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": f"not installed/found: {exc}",
+                }
+            )
             continue
         results.append(_tool_result(label, proc))
 
@@ -557,13 +821,30 @@ def run_static_checks(repo_dir: str, files: List[str]) -> dict:
         if candidate.exists():
             try:
                 proc = _run(
-                    ["pytest", str(candidate.relative_to(cwd)), "-m", "not integration", "-v"],
+                    [
+                        "pytest",
+                        str(candidate.relative_to(cwd)),
+                        "-m",
+                        "not integration",
+                        "-v",
+                    ],
                     cwd=cwd,
                 )
-                results.append(_environment_gap_hint(_tool_result(f"pytest:{candidate.name}", proc)))
+                results.append(
+                    _environment_gap_hint(
+                        _tool_result(f"pytest:{candidate.name}", proc)
+                    )
+                )
             except FileNotFoundError as exc:
-                results.append({"tool": f"pytest:{candidate.name}", "passed": False,
-                                 "returncode": None, "stdout": "", "stderr": str(exc)})
+                results.append(
+                    {
+                        "tool": f"pytest:{candidate.name}",
+                        "passed": False,
+                        "returncode": None,
+                        "stdout": "",
+                        "stderr": str(exc),
+                    }
+                )
 
     return {
         "checked": py_files,
@@ -593,12 +874,14 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
         proc = _run(["pytest", test_path, "-m", markers, "-v"], cwd=cwd)
     except FileNotFoundError as exc:
         return {"passed": False, "stdout": "", "stderr": str(exc), "returncode": None}
-    return _environment_gap_hint({
-        "passed": proc.returncode == 0,
-        "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-    })
+    return _environment_gap_hint(
+        {
+            "passed": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +890,9 @@ def run_pytest(repo_dir: str, test_path: str, markers: str = "not integration") 
 
 
 @mcp.tool()
-def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "") -> dict:
+def get_repo_mapping(
+    source_path: str, job_id: str = "", source_content: str = ""
+) -> dict:
     """
     Resolve a Databricks task's source_path to the git repo it actually lives in, trying three
     mechanisms in order:
@@ -679,7 +964,7 @@ def get_repo_mapping(source_path: str, job_id: str = "", source_content: str = "
                 "source_path": source_path,
                 "repo_url": getattr(found_repo, "url", None),
                 "repo_path_in_workspace": repo_path,
-                "relative_path_in_repo": source_path[len(repo_path):].lstrip("/"),
+                "relative_path_in_repo": source_path[len(repo_path) :].lstrip("/"),
                 "branch": getattr(found_repo, "branch", None),
                 "provider": (str(getattr(found_repo, "provider", "")) or None),
                 "resolution_method": "databricks_repos",
@@ -814,7 +1099,9 @@ def create_pr(repo: str, branch: str, base: str, title: str, body: str) -> dict:
         gh_repo = gh.get_repo(repo)
         pr = gh_repo.create_pull(title=title, body=body, head=branch, base=base)
         return {"pr_number": pr.number, "pr_url": pr.html_url, "error": None}
-    except Exception as exc:  # noqa: BLE001 - PyGithub raises its own exception hierarchy; a
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - PyGithub raises its own exception hierarchy; a
         # clean {"error": ...} beats a caller having to catch a library-specific exception type
         return {"pr_number": None, "pr_url": None, "error": str(exc)}
 
@@ -861,10 +1148,13 @@ _STAGE_HEADERS = {
 }
 
 
-def _incident_summary_blocks(incident: dict, stage: str = "", message: str = "") -> list:
+def _incident_summary_blocks(
+    incident: dict, stage: str = "", message: str = ""
+) -> list:
     header_text = _STAGE_HEADERS.get(stage, "opsbuddy-fix incident summary")
     fields = [
-        {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"} for key, value in incident.items()
+        {"type": "mrkdwn", "text": f"*{key}*\n{value or '-'}"}
+        for key, value in incident.items()
     ]
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": header_text}},
@@ -878,6 +1168,7 @@ def _incident_summary_blocks(incident: dict, stage: str = "", message: str = "")
 @mcp.tool()
 def post_slack_alert(
     jira_ticket_id: str = "",
+    job_id: str = "",
     databricks_run_id: str = "",
     error_category: str = "",
     pr_url: str = "",
@@ -885,9 +1176,10 @@ def post_slack_alert(
     execution_status: str = "",
     stage: str = "",
     message: str = "",
+    thread_ts: str = "",
 ) -> dict:
-    """Send one opsbuddy-fix Slack checkpoint via SLACK_WEBHOOK_URL. Call this up to five times
-    per run, once per checkpoint -- each post is independent, there is no running thread/state:
+    """Send one opsbuddy-fix Slack checkpoint. Call this up to five times per run, once per
+    checkpoint:
       stage="incident_detected"      -- right after Phase 3 files the Jira ticket. Put the plain-
                                          English root cause / RCA summary in `message`.
       stage="pr_opened"               -- Phase 7, PR opened but not yet merged. Put pr_url.
@@ -897,19 +1189,32 @@ def post_slack_alert(
     `stage` only changes the header/emoji shown in Slack -- every other field behaves exactly as
     before, and `stage=""` still sends the original generic "incident summary" header, so existing
     callers that don't pass it keep working unchanged. `message` is free text (e.g. the RCA
-    paragraph or a one-line verification result) shown as its own block below the field grid --
-    there was previously nowhere to put prose like that.
+    paragraph or a one-line verification result) shown as its own block below the field grid.
+    `job_id` is the Databricks job being fixed -- distinct from `databricks_run_id`, which is a
+    specific *run* of that job; pass both when known (job_id stays the same across all five
+    checkpoints of one incident, run_id may not).
+
+    **Threading**: pass no `thread_ts` on the first call (stage="incident_detected") -- that posts
+    the thread's parent. If the response includes a `ts`, keep it and pass it back as `thread_ts`
+    on every later checkpoint's call for this same incident, so all five land as replies in one
+    thread instead of five separate top-level messages. Threading needs SLACK_BOT_TOKEN +
+    SLACK_CHANNEL_ID configured (the Slack Web API's chat.postMessage) -- used automatically
+    instead of the webhook whenever both are set. Falls back to SLACK_WEBHOOK_URL if the bot token
+    isn't configured; `thread_ts` is silently ignored on that path (a webhook can't thread at all,
+    and always posts a new top-level message; the response's `ts` comes back `None`).
+
+    Returns {"sent": bool, "ts": "170000...123", "channel": "C0123...", "error": None} on the
+    bot-token path (ts/channel needed for a later reply), {"sent": bool, "ts": None,
+    "channel": None, "error": None} on the webhook path (nothing to thread into later), or
+    {"sent": False, "ts": None, "channel": None, "error": "..."} if neither is configured or the
+    call fails.
+
     Mirrors workflow/slack_workflow.py's send-incident-summary exactly (same fields, same block
-    layout) so the message looks identical regardless of which client sent it."""
-    if not SLACK_WEBHOOK_URL:
-        return {"sent": False, "error": "SLACK_WEBHOOK_URL must be set for post_slack_alert."}
-    # Same CA-bundle fix create_pr/find_open_pr already needed, for the same reason: behind a
-    # TLS-intercepting corporate proxy, requests.post() fails outright with
-    # SSLCertVerificationError against the public CA bundle alone -- confirmed in practice, this
-    # was missing here and broke Slack alerts on a Desktop run behind Zscaler.
-    _ensure_ca_bundle()
+    layout, same threading contract) so the message looks identical regardless of which client
+    sent it."""
     incident = {
         "Jira Ticket": jira_ticket_id,
+        "Job ID": job_id,
         "Databricks Run ID": databricks_run_id,
         "Error Category": error_category,
         "PR": pr_url,
@@ -917,19 +1222,74 @@ def post_slack_alert(
         "Execution Status": execution_status,
     }
     text = f"[opsbuddy-fix] {jira_ticket_id or databricks_run_id} -- {stage or execution_status or 'update'}"
+    blocks = _incident_summary_blocks(incident, stage=stage, message=message)
     import requests
 
+    # Same CA-bundle fix create_pr/find_open_pr and the webhook path below already needed, for
+    # the same reason: behind a TLS-intercepting corporate proxy, requests.post() fails outright
+    # with SSLCertVerificationError against the public CA bundle alone. Confirmed in practice --
+    # this was missing on this specific path (only the webhook fallback had it) and broke the
+    # very first live bot-token Slack call.
+    _ensure_ca_bundle()
+
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
+        payload = {"channel": SLACK_CHANNEL_ID, "text": text, "blocks": blocks}
+        if thread_ts:
+            payload["thread_ts"] = thread_ts
+        try:
+            response = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={
+                    "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+                    "Content-Type": "application/json; charset=utf-8",
+                },
+                json=payload,
+                timeout=10,
+            )
+            data = response.json()
+        except (
+            Exception
+        ) as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+            return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
+        if not data.get("ok"):
+            return {
+                "sent": False,
+                "ts": None,
+                "channel": None,
+                "error": f"Slack API error: {data.get('error')}",
+            }
+        return {
+            "sent": True,
+            "ts": data.get("ts"),
+            "channel": data.get("channel"),
+            "error": None,
+        }
+
+    if not SLACK_WEBHOOK_URL:
+        return {
+            "sent": False,
+            "ts": None,
+            "channel": None,
+            "error": "Neither SLACK_BOT_TOKEN+SLACK_CHANNEL_ID nor SLACK_WEBHOOK_URL is configured.",
+        }
     try:
         response = requests.post(
             SLACK_WEBHOOK_URL,
-            json={"text": text, "blocks": _incident_summary_blocks(incident, stage=stage, message=message)},
+            json={"text": text, "blocks": blocks},
             timeout=10,
         )
-    except Exception as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
-        return {"sent": False, "error": str(exc)}
+    except (
+        Exception
+    ) as exc:  # noqa: BLE001 - network/DNS/timeout, all reduce to one verdict
+        return {"sent": False, "ts": None, "channel": None, "error": str(exc)}
     if response.status_code != 200:
-        return {"sent": False, "error": f"Slack webhook returned {response.status_code}: {response.text}"}
-    return {"sent": True, "error": None}
+        return {
+            "sent": False,
+            "ts": None,
+            "channel": None,
+            "error": f"Slack webhook returned {response.status_code}: {response.text}",
+        }
+    return {"sent": True, "ts": None, "channel": None, "error": None}
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +1333,8 @@ def log_incident(record: dict) -> dict:
     DELTA_INSERT_COLUMN_MISMATCH naming the real column -- if a future table redesign changes
     these names, update this docstring to match rather than guessing from the error alone each
     time. Mirrors python/utils/databricks_conn.py's insert_ops_incident_log exactly (same SQL
-    construction, same `loaded_at` default) so behavior stays identical to the Bash path."""
+    construction, same `loaded_at` default) so behavior stays identical to the Bash path.
+    """
     if not DATABRICKS_SQL_WAREHOUSE_ID:
         return {
             "logged": False,
@@ -995,18 +1356,10 @@ def log_incident(record: dict) -> dict:
         f"VALUES ({', '.join(values)})"
     )
 
-    from databricks.sdk.errors import DatabricksError
-
     try:
-        response = client.statement_execution.execute_statement(
-            statement=sql, warehouse_id=DATABRICKS_SQL_WAREHOUSE_ID, wait_timeout="30s"
-        )
-    except DatabricksError as exc:
+        _execute_sql(client, sql)
+    except RuntimeError as exc:
         return {"logged": False, "error": str(exc)}
-
-    status = response.status
-    if status and status.state and status.state.value != "SUCCEEDED":
-        return {"logged": False, "error": f"Databricks SQL statement failed: {status}"}
     return {"logged": True, "incident_id": record.get("incident_id"), "error": None}
 
 
@@ -1020,7 +1373,8 @@ def read_file(repo_dir: str, path: str) -> dict:
     """Read a text file at `path` (relative to an already-cloned `repo_dir`). For Phase 5 on
     Claude Desktop, which has no file-reading tool of its own -- read the file here, edit its
     content, then pass the whole new content to write_file. Whole-file only; there is no
-    line-range/patch mode. Text files only -- a binary file will fail to decode as UTF-8."""
+    line-range/patch mode. Text files only -- a binary file will fail to decode as UTF-8.
+    """
     try:
         target = _resolve_repo_relative(repo_dir, path)
     except ValueError as exc:
@@ -1042,7 +1396,8 @@ def write_file(repo_dir: str, path: str, content: str) -> dict:
     already-cloned `repo_dir`), overwriting it if it exists or creating it (and any missing
     parent directories) if not. Whole-file only -- always read_file first and edit its content in
     full, rather than guessing at a partial patch. This is a plain file write, not a git
-    operation -- git_status/git_commit still need to be called afterward to stage and commit it."""
+    operation -- git_status/git_commit still need to be called afterward to stage and commit it.
+    """
     try:
         target = _resolve_repo_relative(repo_dir, path)
     except ValueError as exc:
@@ -1068,7 +1423,11 @@ def _pick_failed_task(run):
     tasks = run.tasks or []
     for task in tasks:
         state = task.state
-        if state and state.result_state and state.result_state.value in _FAILED_RESULT_STATES:
+        if (
+            state
+            and state.result_state
+            and state.result_state.value in _FAILED_RESULT_STATES
+        ):
             return task
     return tasks[0] if tasks else None
 
@@ -1107,10 +1466,14 @@ def get_job_run(run_id: str) -> dict:
     task = _pick_failed_task(run)
     error_message, stack_trace = "", ""
     try:
-        output = client.jobs.get_run_output(run_id=(task.run_id if task else run.run_id))
+        output = client.jobs.get_run_output(
+            run_id=(task.run_id if task else run.run_id)
+        )
         error_message = output.error or ""
         stack_trace = output.error_trace or ""
-    except Exception:  # noqa: BLE001 - SDK/network edge cases -- degrade gracefully, same as CLI
+    except (
+        Exception
+    ):  # noqa: BLE001 - SDK/network edge cases -- degrade gracefully, same as CLI
         pass
 
     state = run.state
@@ -1120,9 +1483,13 @@ def get_job_run(run_id: str) -> dict:
         "job_name": run.run_name or "",
         "task_key": task.task_key if task else "",
         "life_cycle_state": (
-            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+            state.life_cycle_state.value
+            if state and state.life_cycle_state
+            else "UNKNOWN"
         ),
-        "result_state": state.result_state.value if state and state.result_state else "-",
+        "result_state": (
+            state.result_state.value if state and state.result_state else "-"
+        ),
         "error_message": error_message,
         "stack_trace": stack_trace,
         "cluster_id": getattr(task, "existing_cluster_id", None) if task else None,
@@ -1150,9 +1517,13 @@ def get_latest_failed_run(job_id: str) -> dict:
     from databricks.sdk.errors import DatabricksError
 
     try:
-        for run in client.jobs.list_runs(job_id=int(job_id), active_only=False, limit=25):
+        for run in client.jobs.list_runs(
+            job_id=int(job_id), active_only=False, limit=25
+        ):
             state = run.state
-            result_state = state.result_state.value if state and state.result_state else None
+            result_state = (
+                state.result_state.value if state and state.result_state else None
+            )
             if result_state in _FAILED_RESULT_STATES:
                 return {"run_id": run.run_id, "error": None}
     except DatabricksError as exc:
@@ -1168,7 +1539,9 @@ def get_latest_failed_run(job_id: str) -> dict:
 
 
 @mcp.tool()
-def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False) -> dict:
+def trigger_job_run(
+    job_id: str, timeout_seconds: int = 600, force: bool = False
+) -> dict:
     """Re-run a persistent Databricks job and block until it reaches a terminal state -- used
     for opsbuddy-fix's Gate 8.5 real-verification step, to prove a fix actually works rather
     than trusting a code review alone. Real production jobs can write real data, so unless
@@ -1202,7 +1575,10 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
     except DatabricksError as exc:
         return {"succeeded": None, "error": str(exc)}
     except (TypeError, ValueError):
-        return {"succeeded": None, "error": f"job_id must be an integer, got {job_id!r}"}
+        return {
+            "succeeded": None,
+            "error": f"job_id must be an integer, got {job_id!r}",
+        }
 
     run_id = run.run_id
     elapsed = 0
@@ -1211,7 +1587,9 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
         run_status = client.jobs.get_run(run_id=run_id)
         state = run_status.state
         life_cycle = (
-            state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+            state.life_cycle_state.value
+            if state and state.life_cycle_state
+            else "UNKNOWN"
         )
         result_state = state.result_state.value if state and state.result_state else "-"
         if life_cycle in _TERMINAL_LIFE_CYCLE_STATES:
@@ -1232,6 +1610,275 @@ def trigger_job_run(job_id: str, timeout_seconds: int = 600, force: bool = False
     }
 
 
+# ---------------------------------------------------------------------------
+# 18. get_table_lineage
+# ---------------------------------------------------------------------------
+
+
+def _job_name(client, job_id) -> str:
+    """Best-effort job name lookup, for annotating a lineage consumer that's a job rather than a
+    bare ID -- never worth failing the whole lineage call over."""
+    try:
+        job = client.jobs.get(job_id=int(job_id))
+        return (
+            job.settings.name if job.settings and job.settings.name else f"job {job_id}"
+        )
+    except Exception:  # noqa: BLE001
+        return f"job {job_id}"
+
+
+@mcp.tool()
+def get_table_lineage(run_id: str) -> dict:
+    """Unity Catalog table lineage for a specific job run -- which tables the run's task(s) read
+    from and wrote to, plus anything downstream that reads from those same tables (the actual
+    blast radius of a bad run, not just "which tasks in this job failed" like get_job_run's
+    downstream-task info already covers). This is real data lineage, distinct from that --
+    get_job_run only ever looks inside one job's own task DAG; this looks at the tables
+    themselves across the whole workspace.
+
+    Needs DATABRICKS_HOST/DATABRICKS_TOKEN (same as get_repo_mapping/get_job_run) plus
+    DATABRICKS_SQL_WAREHOUSE_ID -- reuse the same value already configured for log_incident and
+    for the sibling databricks-job-lineage plugin's own DATABRICKS_SQL_WAREHOUSE_ID if one is
+    registered, rather than a new credential. Queries system.access.table_lineage via a SQL
+    warehouse; requires Unity Catalog lineage tracking enabled on the workspace. The exact column
+    names of that system table can vary by workspace/Databricks release -- this assumes
+    entity_type/entity_run_id/source_table_full_name/target_table_full_name; if this starts
+    erroring, run `DESCRIBE system.access.table_lineage` in a SQL editor and adjust the queries
+    below to match.
+
+    Also resolves one hop of lineage in **both** directions, not just downstream: `upstream_producers`
+    is whatever wrote the tables this run *read* (the thing to check if the real root cause is
+    bad data from further back in the pipeline, not this run's own code), symmetric to
+    `downstream_consumers` (whatever reads the tables this run *wrote*). Neither is transitive --
+    this is one hop each way, not a full DAG walk; call this again on an upstream producer's own
+    run_id if you need to go back further.
+
+    Fails soft, same philosophy as every other tool here: returns an `error` field instead of
+    raising when something's wrong (no warehouse configured, UC lineage not enabled, the query
+    itself errors), and returns genuinely empty lists when there's honestly nothing there (the
+    run never got far enough to read/write anything) -- don't let a caller mistake "couldn't
+    check" for "there's nothing there."
+    """
+    empty = {
+        "tables_read": [],
+        "tables_written": [],
+        "upstream_producers": [],
+        "downstream_consumers": [],
+    }
+    if not DATABRICKS_SQL_WAREHOUSE_ID:
+        return {
+            **empty,
+            "error": (
+                "DATABRICKS_SQL_WAREHOUSE_ID is not configured -- table lineage requires a SQL "
+                "warehouse to query Unity Catalog system tables."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {**empty, "error": str(exc)}
+
+    def run_query(statement):
+        return _execute_sql(client, statement)
+
+    try:
+        rows = run_query(f"""
+            SELECT DISTINCT source_table_full_name, target_table_full_name
+            FROM system.access.table_lineage
+            WHERE entity_type = 'JOB' AND entity_run_id = '{run_id}'
+            """)
+    except RuntimeError as exc:
+        return {**empty, "error": f"table_lineage query failed: {exc}"}
+
+    tables_read = sorted({r[0] for r in rows if r and r[0]})
+    tables_written = sorted({r[1] for r in rows if r and r[1]})
+
+    def neighbor_entities(tables, column):
+        """One hop of lineage neighbors touching `tables` via `column`
+        (source_table_full_name for consumers of what we wrote, target_table_full_name for
+        producers of what we read), excluding this run itself."""
+        if not tables:
+            return [], None
+        in_clause = ", ".join(f"'{t}'" for t in tables)
+        try:
+            rows = run_query(f"""
+                SELECT DISTINCT entity_type, entity_id
+                FROM system.access.table_lineage
+                WHERE {column} IN ({in_clause})
+                  AND entity_run_id != '{run_id}'
+                """)
+        except RuntimeError as exc:
+            return [], str(exc)
+        entities = [
+            {
+                "type": (entity_type or "unknown").lower(),
+                "name": (
+                    _job_name(client, entity_id)
+                    if entity_type == "JOB"
+                    else str(entity_id)
+                ),
+                "id": str(entity_id),
+            }
+            for entity_type, entity_id in rows
+        ]
+        return entities, None
+
+    upstream_producers, upstream_error = neighbor_entities(
+        tables_read, "target_table_full_name"
+    )
+    if upstream_error:
+        return {
+            "tables_read": tables_read,
+            "tables_written": tables_written,
+            "upstream_producers": [],
+            "downstream_consumers": [],
+            "error": f"upstream producer lookup failed (tables read/written above are still valid): {upstream_error}",
+        }
+
+    downstream_consumers, downstream_error = neighbor_entities(
+        tables_written, "source_table_full_name"
+    )
+    if downstream_error:
+        return {
+            "tables_read": tables_read,
+            "tables_written": tables_written,
+            "upstream_producers": upstream_producers,
+            "downstream_consumers": [],
+            "error": f"downstream consumer lookup failed (everything else above is still valid): {downstream_error}",
+        }
+
+    return {
+        "tables_read": tables_read,
+        "tables_written": tables_written,
+        "upstream_producers": upstream_producers,
+        "downstream_consumers": downstream_consumers,
+        "error": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 19. get_incident_history
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_incident_history(
+    job_id: str = "", error_category: str = "", days: int = 30
+) -> dict:
+    """Look up past incidents from the Databricks ops incident-log table
+    (DATABRICKS_OPS_INCIDENT_TABLE, default dev.ops_incidents.incident_log -- the same table
+    log_incident writes to). log_incident is insert-only; nothing else here ever reads it back,
+    so every failure gets diagnosed as if it's the first time that job has ever broken. Call
+    this in Phase 1, alongside get_job_run, to check that assumption before it's made.
+
+    At least one of `job_id`/`error_category` must be passed -- an unfiltered scan of the whole
+    table isn't a query this tool is meant to make easy to do by accident. Two shapes:
+      - `job_id` only (or with `error_category` too): "has *this specific job* failed before?"
+        -- the original, narrower question.
+      - `error_category` with `job_id` left empty: "has *any* job hit this failure category
+        recently?" -- catches a platform-wide issue (e.g. a Databricks Runtime upgrade that
+        silently changed ANSI SQL defaults and started breaking every job using a certain date-
+        parsing pattern) that looking at one job in isolation would never surface, since each
+        affected job just looks like its own unrelated, first-time incident.
+    `days` bounds how far back to look by detected_at (default 30).
+
+    Returns:
+      {"incidents": [{incident_id, jira_ticket_id, databricks_job_id, error_category,
+                      root_cause_summary, execution_status, pr_url, detected_at, resolved_at},
+                      ...], "count": <int>, "distinct_jobs_affected": <int>,
+       "is_recurring": <bool, true if count >= 2>, "error": None}
+    or the same shape with empty/zero values and `error` set if DATABRICKS_SQL_WAREHOUSE_ID isn't
+    configured, no filter was given, or the query fails -- same fail-soft contract as
+    get_table_lineage: an error here means "couldn't check," not "no history exists," and a
+    caller should say so plainly rather than silently treating this failure as a first-time one.
+    `distinct_jobs_affected` is what actually signals "platform-wide" on an error_category-only
+    query -- 5 incidents that are all the same one job recurring isn't the same story as 5
+    incidents spread across 5 different jobs on the same day.
+
+    Deliberately read-only and diagnostic, not a shortcut: matching history is a signal for the
+    human/reviewing agent (this is the Nth time, the last fix may not have stuck, or this looks
+    bigger than one job) -- not a license to skip re-diagnosing and reapply whatever fixed it
+    last time. The code may have changed since; blindly replaying an old patch risks causing a
+    different, new incident instead of preventing one."""
+    empty = {
+        "incidents": [],
+        "count": 0,
+        "distinct_jobs_affected": 0,
+        "is_recurring": False,
+    }
+    if not job_id and not error_category:
+        return {
+            **empty,
+            "error": "At least one of job_id/error_category must be passed.",
+        }
+    if not DATABRICKS_SQL_WAREHOUSE_ID:
+        return {
+            **empty,
+            "error": (
+                "DATABRICKS_SQL_WAREHOUSE_ID is not configured -- incident history requires a "
+                "SQL warehouse to query the incident-log table (same var log_incident/"
+                "get_table_lineage already use)."
+            ),
+        }
+    try:
+        client = _databricks_client()
+    except RuntimeError as exc:
+        return {**empty, "error": str(exc)}
+
+    # databricks_job_id is stored as a number, not a string (log_incident writes it via
+    # _sql_literal's int branch, unquoted) -- comparing it against a quoted string literal
+    # risks a silent implicit-cast mismatch depending on warehouse settings, so validate and
+    # emit it unquoted here too, matching exactly how it was written.
+    job_filter = ""
+    if job_id:
+        try:
+            job_filter = f"AND databricks_job_id = {_sql_literal(int(job_id))}"
+        except (TypeError, ValueError):
+            return {**empty, "error": f"job_id must be an integer, got {job_id!r}"}
+
+    category_filter = ""
+    if error_category:
+        escaped = error_category.replace("'", "''")
+        category_filter = f"AND error_category = '{escaped}'"
+
+    sql = f"""
+        SELECT incident_id, jira_ticket_id, databricks_job_id, error_category,
+               root_cause_summary, execution_status, pr_url, detected_at, resolved_at
+        FROM {DATABRICKS_OPS_INCIDENT_TABLE}
+        WHERE detected_at >= current_timestamp() - INTERVAL {int(days)} DAYS
+          {job_filter}
+          {category_filter}
+        ORDER BY detected_at DESC
+    """
+
+    try:
+        rows = _execute_sql(client, sql)
+    except RuntimeError as exc:
+        return {**empty, "error": f"incident history query failed: {exc}"}
+
+    incidents = [
+        {
+            "incident_id": r[0],
+            "jira_ticket_id": r[1],
+            "databricks_job_id": r[2],
+            "error_category": r[3],
+            "root_cause_summary": r[4],
+            "execution_status": r[5],
+            "pr_url": r[6],
+            "detected_at": r[7],
+            "resolved_at": r[8],
+        }
+        for r in rows
+    ]
+    return {
+        "incidents": incidents,
+        "count": len(incidents),
+        "distinct_jobs_affected": len({i["databricks_job_id"] for i in incidents}),
+        "is_recurring": len(incidents) >= 2,
+        "error": None,
+    }
+
+
 def _run_http() -> None:
     """Serve over Streamable HTTP behind a bearer-token check -- see the databricks-lineage
     server's README for what this trades off; same shape here."""
@@ -1239,7 +1886,7 @@ def _run_http() -> None:
         print(
             "FATAL: MCP_TRANSPORT=http requires MCP_API_KEY to be set.\n"
             "  export MCP_API_KEY=<a long random string>\n"
-            "  (generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\")",
+            '  (generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))")',
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1272,6 +1919,8 @@ if __name__ == "__main__":
     elif MCP_TRANSPORT in ("http", "streamable-http"):
         _run_http()
     else:
-        print(f"FATAL: unknown MCP_TRANSPORT={MCP_TRANSPORT!r} (expected 'stdio' or 'http')",
-              file=sys.stderr)
+        print(
+            f"FATAL: unknown MCP_TRANSPORT={MCP_TRANSPORT!r} (expected 'stdio' or 'http')",
+            file=sys.stderr,
+        )
         sys.exit(1)

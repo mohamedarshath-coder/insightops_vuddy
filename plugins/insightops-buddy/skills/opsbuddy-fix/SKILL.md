@@ -5,9 +5,9 @@ description: >-
   telemetry, classify via databricks-debug + the root-cause-analysis (Cat L) agent, file a Jira
   ticket and carry it through a full Kanban lifecycle (To Do -> In Progress -> In Review -> Done),
   gate on whether a code fix is possible, resolve the backing repo, apply and validate the fix,
-  open a PR, run an automated Mode A review, post a 5-stage Slack timeline (detected, PR opened,
-  merged, verifying, resolved), update Jira, log the incident, and publish a Confluence
-  postmortem page. Use whenever given a Databricks job run ID or job ID and asked to fix,
+  open a PR, run an automated Mode A review, post one threaded 5-stage Slack timeline (detected,
+  PR opened, merged, verifying, resolved -- tagged with the job ID at every stage), update Jira,
+  log the incident, and publish a Confluence postmortem page. Use whenever given a Databricks job run ID or job ID and asked to fix,
   resolve, or triage a failure end-to-end (e.g. "job 91004 failed, fix it", "run opsbuddy-fix on
   run 48213"). For read-only diagnosis with no fix/PR, use databricks-debug instead.
 ---
@@ -44,10 +44,12 @@ fails/times out — never block the run on an MCP server being present:
   adjust if it differs.
 - `opsbuddy-git-ops`, from **this** plugin's own bundled `mcp-server/` (see this repo's top-level
   README) — `git_clone`, `git_create_branch`, `git_status`, `git_commit`, `git_push`,
-  `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
-  `post_slack_alert`, `log_incident`, `read_file`, `write_file`. This is the only tool set in this
-  list whose contract is actually verified against this skill's needs (built and tested for it
-  specifically) — prefer it over a generically-registered server below whenever both could do the
+  `git_cleanup`, `run_static_checks`, `run_pytest`, `get_repo_mapping`, `create_pr`, `find_open_pr`,
+  `post_slack_alert`, `log_incident`, `read_file`, `write_file`, `get_job_run`,
+  `get_latest_failed_run`, `trigger_job_run`, `get_table_lineage`, `get_incident_history`. This is
+  the only tool set in this list whose contract is actually verified against this skill's needs
+  (built and tested for it specifically) — prefer it over a generically-registered server below
+  whenever both could do the
   same job.
 - The **Atlassian connector** (`mcp__claude_ai_Atlassian__*`) — `getVisibleJiraProjects`,
   `searchJiraIssuesUsingJql`, `createJiraIssue`, `addCommentToJiraIssue`, `transitionJiraIssue`,
@@ -67,10 +69,10 @@ fails/times out — never block the run on an MCP server being present:
   tools and this script hit the same REST API).
 - A **generic Slack MCP server** (e.g. `@modelcontextprotocol/server-slack`, if registered) —
   `slack_post_message`. Lower priority than this plugin's own `post_slack_alert` above: this one's
-  exact tool name/args aren't verified against your installed server in this session, and it needs
-  a channel ID (`SLACK_CHANNEL_ID` or similar) that `post_slack_alert`/`send-incident-summary`
-  don't need, since both post via `SLACK_WEBHOOK_URL` instead. Only reach for this if
-  `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere.
+  exact tool name/args aren't verified against your installed server in this session. Only reach
+  for this if `SLACK_WEBHOOK_URL` genuinely isn't configured anywhere *and* `post_slack_alert`'s
+  own `SLACK_BOT_TOKEN`+`SLACK_CHANNEL_ID` path (see below) isn't either — `post_slack_alert` can
+  now thread its own replies, so there's rarely a reason to reach past it for a generic server.
 
 Phase 1 telemetry, Phase 7 PR creation, Gate 8.5's real-verification trigger, and Phase 10
 alerting/incident-logging all now have a verified MCP path via this plugin's own
@@ -199,6 +201,79 @@ Capture job name, task key, life-cycle/result state, full error message and stac
 code; that's a separate fetch in Phase 2/4 (see below), since only the stack trace and file
 names come from telemetry.
 
+**Also pull real data lineage, best-effort:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_table_lineage(run_id="$ARGUMENTS")
+```
+Capture `tables_read`, `tables_written`, `upstream_producers`, and `downstream_consumers` — this
+is the actual data blast radius, in both directions: `downstream_consumers` is what else in the
+workspace reads the tables this run touched (distinct from and in addition to the task-level
+"Downstream impact" Phase 3's ticket already reports); `upstream_producers` is what actually wrote
+the tables this run read. **If `upstream_producers` names a job that isn't the one this run
+belongs to, that's worth a plain note in the ticket** ("root cause may originate upstream in
+`<upstream job name>`, which produced `<table>`") — Phase 2's diagnosis still proceeds against
+*this* run's own code, this skill doesn't pivot to diagnosing or fixing a different job on its own
+initiative, but the human reading the ticket should see the lead rather than have to go find it
+themselves. This needs `DATABRICKS_SQL_WAREHOUSE_ID` and Unity Catalog lineage tracking enabled —
+**if it comes back with an `error` (not configured, UC lineage off, query failed), don't block or
+retry: note lineage as "unavailable" in Phase 3's ticket and move on.** This is enrichment, not a
+prerequisite — Phase 2's diagnosis and everything after it proceeds identically whether or not
+this call actually returns data.
+
+**Also check whether this exact job has failed before:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_incident_history(job_id="<job_id>")
+```
+`log_incident` (Phase 10) is insert-only — nothing before this ever read the incident log back,
+so every failure was diagnosed as if it were the first time, even on a job that's failed the same
+way repeatedly. **If `is_recurring` is true, say so plainly in Phase 3's ticket** — "this job has
+failed N times in the last 30 days, most recently `<jira_ticket_id>` (`<execution_status>`)" —
+this is a signal for the human that the last fix may not have actually stuck, or only covered
+part of the problem, not something to act on unprompted. **Never use this as a shortcut to skip
+Phase 2's diagnosis and just reapply whatever fixed it last time** — the code may have changed
+since, and blindly replaying an old patch risks causing a different, new incident instead of
+preventing one. Same fail-soft treatment as lineage: if it errors (not configured, query failed),
+note history as "unavailable" and continue — this must never block or delay diagnosis.
+
+**If a past incident for this job is found and already resolved, pull its fix as reference
+material for Phase 2 (not a shortcut):**
+```
+# via whatever GitHub MCP server is connected (native `github` connector, if available) -- exact
+# tool name varies by server (`get_pull_request_diff`, `get_pull_request_files`, etc.), same
+# "varies by server" caveat as Phase 8's CI status lookup below
+
+# Bash fallback
+gh pr diff <pr_number> --repo <owner/repo>
+```
+Only do this when the most recent matching incident's `execution_status` indicates it actually
+resolved (e.g. `Done`) and `pr_url` is present — an incident that's still open or was abandoned
+has no fix worth referencing. Hand the diff to both Phase 2 diagnosis agents as **reference
+material only**, explicitly labeled as such -- e.g. "a past incident on this job with the same
+error category was fixed by the attached diff; this may or may not still apply, diagnose the
+current code independently and only note the similarity if it genuinely explains the current
+failure." **This must never replace Phase 2's actual diagnosis of the current code** — same
+reasoning as the `is_recurring` guardrail above: the code may have changed since, the past fix
+may no longer be relevant, and pattern-matching to an old diff risks proposing a fix that doesn't
+address what's actually broken now. If the diff can't be fetched (no suitable tool connected, the
+PR's branch was since deleted, etc.), skip this silently — enrichment, not a prerequisite, same
+fail-soft treatment as everything else in this phase.
+
+**After Phase 2 assigns `ERROR_CATEGORY`, also check whether it's showing up platform-wide:**
+```
+# MCP-preferred (this plugin's own opsbuddy-git-ops)
+mcp__plugin_insightops-buddy_opsbuddy-git-ops__get_incident_history(error_category="<ERROR_CATEGORY>")
+```
+This is a separate query from the job-scoped one above — it looks across **every** job in the
+window, not just this one, so it catches platform-wide causes (e.g. an ANSI-mode runtime upgrade
+that silently breaks every job doing lenient date parsing) that only ever show up as isolated,
+unrelated-looking incidents when checked one job at a time. **If `distinct_jobs_affected` is
+greater than 1, say so plainly in Phase 3's ticket** — "`<ERROR_CATEGORY>` has also hit N other
+job(s) in the last 30 days: `<job ids>`" — again a lead for the human, not something this skill
+acts on by broadening its own fix beyond the job it was asked to diagnose. Same fail-soft
+treatment: if it errors or isn't configured, note as "unavailable" and continue.
+
 ## Phase 2 — Diagnose
 
 Invoke the **databricks-debug** sub-skill with the Phase 1 telemetry. It maps the stack trace
@@ -208,7 +283,9 @@ Timeout/Startup Failure, Dependency/Library Import Error, Data Skew/Partition Ex
 Upstream Task Dependency Failure, Infrastructure/Cloud Provider Error) and spawns **two
 independent** `root-cause-analysis` (Cat L) agent instances — each given the real source content
 fetched via GitHub (see Phase 4's repo resolution; do this lookup early enough to hand real
-source to both agents, not just the error message) — reconciling them into one verdict:
+source to both agents, not just the error message) and, when Phase 1 found one, a past resolved
+incident's diff as reference-only material (see Phase 1 — never a substitute for diagnosing the
+current code) — reconciling them into one verdict:
 ```
 ERROR_CATEGORY: <one of the 11 standardized categories>
 ROOT_CAUSE_SUMMARY: <2-4 sentences>
@@ -246,14 +323,111 @@ mcp__claude_ai_Atlassian__getJiraProjectIssueTypesMetadata(cloudId="<cloudId>", 
 mcp__claude_ai_Atlassian__createJiraIssue(cloudId="<cloudId>", projectKey="<project>",
   issueTypeName="<first available of Incident/Bug/Task/Story>",
   summary="[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>",
-  description="<run metadata + full diagnostics markdown>",
+  description="<run metadata + full diagnostics -- standard Markdown, see format note below>",
   additional_fields={"priority": {"name": "High"}, "labels": ["opsbuddy-fix"]})
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py create --project <project> --type Task \
   --summary "[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>" \
-  --description "<run metadata + full diagnostics markdown>" --priority High --label opsbuddy-fix
+  --description "<run metadata + full diagnostics -- standard Markdown>" --priority High --label opsbuddy-fix
 ```
+**Description format — standard Markdown only, never Jira wiki markup.** The Atlassian
+connector's `description` renders CommonMark Markdown and converts it to ADF itself — it does
+**not** render Jira/Confluence wiki markup. Confirmed wrong **twice** in practice on real runs,
+the second time despite this exact warning already being here — so before writing the
+description, check every heading/code block/inline-code span against this table, character by
+character, not from memory:
+
+| Never write (wiki markup) | Always write (Markdown) |
+|---|---|
+| `h2. Root cause` | `## Root cause` or `### Root cause` |
+| `{code}...{code}` | ```` ```...``` ```` (triple backtick fence) |
+| `{{inline code}}` | `` `inline code` `` (single backtick) |
+| `{quote}...{quote}` | `> quoted text` |
+
+Both confirmed failures looked identical: the description posted successfully with no error, and
+only *looked* wrong once opened in Jira's own UI — `h2. Root cause` renders as the literal plain
+text "h2. Root cause", not a heading. There's no error to catch this; it has to be gotten right
+the first time by matching the table above, not by writing what looks natural for a Jira ticket.
+Use exactly this shape:
+
+```markdown
+### Run details
+Job: <job_name> (job_id <job_id>)
+Run ID: <run_id>
+Failed task: <task_key> (<source_path>)
+Downstream impact: <tasks that went UPSTREAM_FAILED, or "none">
+Run page: <run_page_url>
+
+### Data lineage
+Tables read: <tables_read, or "none">
+Tables written: <tables_written, or "none">
+Upstream producers: <upstream_producers -- name + type per line, or "none found">
+Downstream consumers: <downstream_consumers -- name + type per line, or "none found">
+(if upstream_producers names a job other than this one, add one line here: "Possible upstream
+root cause: <job name> produced <table>" -- a lead for the human, not a conclusion this skill
+draws on its own)
+(**never omit this section header.** If Phase 1's get_table_lineage call errored or wasn't
+configured, replace the four lines above with a single line: "unavailable" -- so a reader sees
+the section was checked and just couldn't be retrieved, not that no one thought to check. The
+section header always appears; only its content ever changes.)
+
+### Incident history
+<if get_incident_history(job_id=...)'s count is 0: "No prior incidents found for this job in the
+last 30 days.">
+<if count >= 1: "This job has failed N time(s) in the last 30 days. Most recent: <jira_ticket_id>
+(<execution_status>, <error_category>, detected <detected_at>)." -- and if is_recurring, add:
+"This is a recurring failure — the previous fix may not have fully resolved it.">
+(**never omit this section header** -- same rule as Data lineage above: replace the content with
+"unavailable" if the call errored or wasn't configured, never delete the section itself)
+<if get_incident_history(error_category=...)'s distinct_jobs_affected > 1: "<ERROR_CATEGORY> has
+also affected N other job(s) in the last 30 days: <job ids>, suggesting a platform-wide cause
+rather than something isolated to this job.">
+(omit this line entirely if distinct_jobs_affected <= 1 -- no need to state a negative)
+
+### Business impact
+<if downstream_consumers is non-empty: "This failure blocks N downstream table(s)/consumer(s)
+from refreshing: <downstream_consumers, name + type per line>.">
+<if is_recurring or distinct_jobs_affected > 1: one plain-language line combining whichever
+applies -- e.g. "This is the Nth failure for this job in the last 30 days" and/or "part of a
+platform-wide pattern affecting M jobs" -- phrased for a reader deciding how urgently to act, not
+a restatement of the Incident history section's exact wording>
+(omit this whole section if there's nothing to report -- no downstream consumers found AND not
+recurring/platform-wide -- rather than printing an empty or all-negative section. This section is
+purely a synthesis of data already gathered above in Data lineage and Incident history, not new
+data collection, and not a severity/priority judgment the skill makes on its own -- it exists so
+a non-technical reader doesn't have to piece the business consequence together themselves from
+the more technical sections above it.)
+
+### Error
+```
+<the real error message, verbatim>
+```
+
+### Root cause
+ERROR_CATEGORY: <category>
+
+<the actual root-cause paragraph(s) from Phase 2>
+
+### Affected files
+<one path per line>
+
+### Suggested fix
+<the fix approach, in prose>
+
+CODE_FIX_POSSIBLE: <true/false> (<confidence note>)
+```
+
+**Before calling `createJiraIssue`, check the description you've built actually has all of:**
+Run details, Data lineage, Incident history, Error, Root cause, Affected files, Suggested fix —
+plus Business impact if that section applies. Every one of these except Business impact must be
+present in some form (real content or "unavailable") even when the run is about to halt at Gate
+3.5 with no code fix — a ticket that's short on information is exactly the case where a human
+needs *more* context to act on it manually, not less. Confirmed in practice: a real run wrote a
+complete, well-formed ticket that was still missing Data lineage, Incident history, and Business
+impact entirely — not "unavailable," just absent, as if Phase 1 had never run. Treat a
+half-populated ticket as a bug to fix before sending, not a shortcut under time pressure.
+
 (`create` automatically falls back to whatever issue type the project actually has — Incident >
 Bug > Task > Story — if the requested type doesn't exist.) Populate with job/run ID, error
 category, root cause summary, stack trace excerpt, affected files, and — if Phase 2 found a
@@ -275,21 +449,38 @@ mcp__claude_ai_Atlassian__transitionJiraIssue(cloudId="<cloudId>", issueIdOrKey=
 # list if nothing matches -- never hardcodes a transition name blind)
 python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py transition <TICKET-KEY> "In Progress"
 ```
+**If no available transition's name literally contains "in progress"/"doing"/"start"**, fall back
+to matching by the transition's underlying status *category* instead (Jira Cloud issues expose
+this even when a project's actual status names are custom) — but if the transition you land on
+this way has a name that could read as misleading out of context (confirmed in practice: a real
+project's only "in progress"-category status was named "In Review," which implies a PR is
+waiting when one may not exist yet), say so explicitly in whatever comment you next post to this
+ticket -- e.g. "Note: this board's 'in progress' status is named 'In Review' -- no PR exists yet/
+at all for this ticket, despite the column name." A ticket sitting in a column called "In Review"
+with nothing to review is exactly the kind of thing that confuses whoever's triaging the board
+later if it isn't called out where they'll actually see it.
 
 **Slack alert 1/5 — incident detected.** This is the one checkpoint that carries prose, not just
 fields: put the plain-English root cause (from Phase 2's reconciled verdict) in `message` so the
-channel sees *what actually broke*, not just a category label.
+channel sees *what actually broke*, not just a category label. Also the one checkpoint that starts
+the thread every later alert replies into: it's called with no `thread_ts` (there's nothing to
+reply to yet), and if `SLACK_BOT_TOKEN`+`SLACK_CHANNEL_ID` are configured the response includes a
+`ts` — **keep that value** (same way you already keep `<TICKET-KEY>` and `<pr_url>` for later
+phases) and pass it back as `thread_ts` on alerts 2-5 below, so all five land as one thread instead
+of five separate top-level messages. On the plain-webhook path `ts` comes back `None` — nothing to
+carry forward, later alerts just post standalone, exactly as before threading existed.
 ```
 # MCP-preferred (this plugin's own opsbuddy-git-ops)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  execution_status="IN_PROGRESS", stage="incident_detected",
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", execution_status="IN_PROGRESS", stage="incident_detected",
   message="<ROOT_CAUSE_SUMMARY from Phase 2, 2-4 plain-English sentences>")
 
-# Bash fallback
+# Bash fallback -- prints "THREAD_TS=..." on stdout when the bot-token path is configured; carry
+# that value into --thread-ts on alerts 2-5 the same way
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --status IN_PROGRESS \
-  --stage incident_detected --message "<ROOT_CAUSE_SUMMARY from Phase 2>"
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --status IN_PROGRESS --stage incident_detected --message "<ROOT_CAUSE_SUMMARY from Phase 2>"
 ```
 
 ### ⛔ GATE 3.5 — Feasibility (automated)
@@ -305,8 +496,23 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
   # Bash fallback
   python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment <TICKET-KEY> "<explanation>"
   ```
-  — send the Phase 10 Slack alert with `EXECUTION_STATUS=MANUAL_ACTION_REQUIRED`, write the
-  Databricks incident row, jump to Phase 11.
+  then **do not skip straight to a summary** — a halt is not an early exit from the phases below,
+  it's a different value for `EXECUTION_STATUS` flowing through the exact same ones every other
+  outcome goes through. Concretely, still do all three of:
+  1. Phase 10's **Slack alert 5/5** (`stage="resolved"`, `EXECUTION_STATUS=MANUAL_ACTION_REQUIRED`,
+     `message` explaining the halt in one line) — not a different, improvised alert, the same
+     fifth checkpoint every run ends on; skipping it is exactly how a halted incident goes out
+     without anyone in the channel ever being told it's stuck.
+  2. Phase 10's Databricks incident-log row (`execution_status: "MANUAL_ACTION_REQUIRED"`,
+     `resolved_at` omitted since nothing resolved).
+  3. Phase 10.5's Confluence postmortem — a halted incident is exactly the kind of thing worth a
+     postmortem page (documents *why* it's stuck for whoever picks up the manual action later),
+     not something this phase only applies to a clean success.
+  Only *then* move to Phase 11's halt-summary format. Confirmed in practice: an early Desktop run
+  wrote the halt comment above, then jumped straight to a final report of its own shape — Slack
+  5/5 and the Confluence page never fired, and the gap wasn't visible until someone went looking
+  for a fifth Slack message that didn't exist. Treat that as the failure mode this note exists to
+  prevent, not a hypothetical.
 
 ## Phase 4 — Git Setup
 
@@ -406,8 +612,10 @@ earlier Desktop run diagnosed the fix correctly and got as far as creating the h
 had no way to actually write the one-line change and had to halt and hand off to a human.)
 
 Then invoke the **testing** sub-skill for static verification (one bounded retry on failure). If it
-still fails: stop, post a Jira comment, send the Phase 10 Slack alert with
-`EXECUTION_STATUS=REMEDIATION_FAILED`, write the Databricks incident row, jump to Phase 11.
+still fails: stop, post a Jira comment, then complete Phase 10 in full (Slack alert 5/5 with
+`EXECUTION_STATUS=REMEDIATION_FAILED`, the Databricks incident row) **and Phase 10.5's Confluence
+postmortem** before Phase 11's halt summary — same rule as Gate 3.5's halt above: this is a
+different `EXECUTION_STATUS` flowing through every later phase, not a shortcut past them.
 
 ## Phase 6 — Commit & Push
 
@@ -461,17 +669,18 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py comment-rich <TICKET-KEY>
 ```
 
 **Slack alert 2/5 — PR opened, not yet merged.** Send this regardless of which PR-creation path
-you used — neither path sends Slack on its own.
+you used — neither path sends Slack on its own. Pass alert 1's `thread_ts` if you have one.
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="IN_REVIEW", stage="pr_opened")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="IN_REVIEW",
+  stage="pr_opened", thread_ts="<incident's thread ts, if any>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status IN_REVIEW --stage pr_opened
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status IN_REVIEW --stage pr_opened --thread-ts "<incident's thread ts, if any>"
 ```
 
 ## Phase 8 — Automated PR Review
@@ -480,8 +689,11 @@ Spawn the **pr-review-opsbuddy-fix** skill (Mode A), passing the repo, PR number
 root-cause verdict. Returns `PASS`/`FAIL` via its 7-point checklist.
 
 - `PASS` → Gate 8.5.
-- `FAIL` → loop back to Phase 5 **once** (bounded retry). Fails again → stop, Jira comment, Phase
-  10 Slack alert with `EXECUTION_STATUS=REVIEW_FAILED`, Databricks incident row, jump to Phase 11.
+- `FAIL` → loop back to Phase 5 **once** (bounded retry). Fails again → stop, Jira comment, then
+  complete Phase 10 in full (Slack alert 5/5 with `EXECUTION_STATUS=REVIEW_FAILED`, the Databricks
+  incident row) **and Phase 10.5's Confluence postmortem** before Phase 11's halt summary — same
+  rule as Gate 3.5's halt above: a different `EXECUTION_STATUS` through every later phase, not a
+  shortcut past them.
 
 ### ⛔ GATE 8.5 — Verify Fix Against a Real Re-Run
 
@@ -496,14 +708,16 @@ real" before the run itself starts, not only the eventual pass/fail:
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="VERIFYING", stage="verification_running",
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="VERIFYING",
+  stage="verification_running", thread_ts="<incident's thread ts, if any>",
   message="Triggering a real re-run of <job_name> (job <job_id>) to verify the fix.")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status VERIFYING --stage verification_running \
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status VERIFYING --stage verification_running \
+  --thread-ts "<incident's thread ts, if any>" \
   --message "Triggering a real re-run of <job_name> (job <job_id>) to verify the fix."
 ```
 
@@ -554,6 +768,21 @@ confirmed in practice to be this exact plugin's own `test_run` job), Gate 8.5 ca
 verify anything pre-merge: merging to `main` is the only way to make the fix visible to a re-run
 at all, which makes the merge decision itself the real gate, not a formality before one.
 
+**Optional: surface CI status, informational only.** This skill deliberately has no CI gate — it
+never blocks, polls, retries, or attempts to fix anything based on check results (that's a much
+larger, separate concern than this skill takes on; see `git-ci-fix` in the `databricks-job-lineage`
+plugin if that's what you actually want). If a GitHub MCP server is connected (e.g. the native
+`github` connector) and exposes some way to read the PR's check/status state — the exact tool name
+varies by server (`get_pull_request_status`, a combined-status tool, `list_check_runs_for_ref`,
+etc.) — call it once and add one line to the approval request below: `CI status: <n>/<total>
+passing`, `CI status: no checks found`, or `CI status: <n> failing — <check names>`. This is purely
+so the human approving isn't blind to it, not a judgment this skill makes on their behalf — don't
+editorialize on what a failure or an absence of checks means (a project with no CI configured looks
+identical to one whose CI silently broke, and this skill isn't equipped to tell them apart — that
+ambiguity is exactly why there's no gate here, only a line of information). If no such tool is
+available, or the call errors, omit the CI status line entirely rather than guessing or blocking
+the approval request on it.
+
 Before merging, present a plain-language approval request — don't just say "should I merge?":
 ```
 PR #<n> — <repo>
@@ -561,6 +790,7 @@ PR #<n> — <repo>
 - Fixes: <one line per AFFECTED_FILE, plain-language what changed>
 - Mode A review: <verdict>, <n>/7
 - Jira: <TICKET-KEY>, incident logged, alert sent
+- CI status: <n>/<total> passing (omit this line entirely if no check-status tool is available)
 
 If you approve, I will:
 1. Merge PR #<n> into <base>.
@@ -582,13 +812,14 @@ coming back empty or a direct merged-state check, before sending):
 ```
 # MCP-preferred
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", execution_status="MERGED", stage="pr_merged")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", execution_status="MERGED",
+  stage="pr_merged", thread_ts="<incident's thread ts, if any>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" --pr-url <pr_url> \
-  --status MERGED --stage pr_merged
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --pr-url <pr_url> --status MERGED --stage pr_merged --thread-ts "<incident's thread ts, if any>"
 ```
 Note the two mechanisms genuinely order alerts 3 and 4 differently, and that's correct, not a
 bug to reconcile: a job verifiable pre-merge (Databricks Repos checkout / job-level git_source)
@@ -637,18 +868,20 @@ sees it as still open, and say so plainly in the final report.
 only one — by this point the channel has already seen alerts 1-4, so `message` here should be the
 one-line verification result (what Gate 8.5 actually found), not a repeat of the RCA from alert 1:
 ```
-# MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via a pre-configured incoming
-# webhook, same as the Bash path; needs no channel ID unlike a generic Slack MCP server would)
+# MCP-preferred (this plugin's own opsbuddy-git-ops -- posts via SLACK_BOT_TOKEN+SLACK_CHANNEL_ID
+# if configured (threaded reply, same thread as alerts 1-4), else the plain incoming webhook)
 mcp__plugin_insightops-buddy_opsbuddy-git-ops__post_slack_alert(
-  jira_ticket_id="<TICKET-KEY>", databricks_run_id="$ARGUMENTS", error_category="<ERROR_CATEGORY>",
-  pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>", execution_status="<EXECUTION_STATUS>",
-  stage="resolved", message="<one-line Gate 8.5 verification result, or why it was skipped>")
+  jira_ticket_id="<TICKET-KEY>", job_id="<job_id>", databricks_run_id="$ARGUMENTS",
+  error_category="<ERROR_CATEGORY>", pr_url="<pr_url>", pr_review_verdict="<mode-a-verdict>",
+  execution_status="<EXECUTION_STATUS>", stage="resolved", thread_ts="<incident's thread ts, if any>",
+  message="<one-line Gate 8.5 verification result, or why it was skipped>")
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/slack_workflow.py send-incident-summary \
-  --jira-id <TICKET-KEY> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
+  --jira-id <TICKET-KEY> --job-id <job_id> --run-id $ARGUMENTS --category "<ERROR_CATEGORY>" \
   --pr-url <pr_url> --verdict <mode-a-verdict> --status <EXECUTION_STATUS> \
-  --stage resolved --message "<one-line Gate 8.5 verification result, or why it was skipped>"
+  --stage resolved --thread-ts "<incident's thread ts, if any>" \
+  --message "<one-line Gate 8.5 verification result, or why it was skipped>"
 ```
 If the run halted before reaching a terminal state (Gate 3.5/Phase 5/Phase 8/Gate 8.5), this is
 still the right call to make — just with `EXECUTION_STATUS` set to whichever halt status applies
@@ -718,7 +951,7 @@ mcp__claude_ai_Atlassian__getPagesInConfluenceSpace(cloudId="<cloudId>", spaceId
 #   otherwise mcp__claude_ai_Atlassian__createConfluencePage(cloudId="<cloudId>", spaceId="<space>",
 #   title="<TICKET-KEY>: <job_name> incident", body="<storage-format HTML, see Bash fallback's
 #   build_incident_page_html for the exact structure to mirror: metadata table, root cause,
-#   timeline, how-to-verify, related resources>")
+#   data lineage, timeline, how-to-verify, related resources>")
 
 # Bash fallback (this plugin's own new script — builds the same structure, upsert-by-title)
 python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
@@ -726,8 +959,16 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/confluence_workflow.py upsert-page \
   --jira-id <TICKET-KEY> --job-name "<job_name>" --run-id $ARGUMENTS --job-id <job_id> \
   --category "<ERROR_CATEGORY>" --rca "<ROOT_CAUSE_SUMMARY>" --repo "<owner/repo>" \
   --branch "<hotfix branch>" --pr-url <pr_url> --verdict "<mode-a-verdict>" \
-  --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS>
+  --verification "<Gate 8.5 result>" --status <EXECUTION_STATUS> \
+  --tables-read "<Phase 1's tables_read, comma-separated, or 'unavailable'>" \
+  --tables-written "<Phase 1's tables_written, comma-separated, or 'unavailable'>" \
+  --upstream-producers "<Phase 1's upstream_producers, comma-separated 'name (type)', or 'unavailable'>" \
+  --downstream-consumers "<Phase 1's downstream_consumers, comma-separated 'name (type)', or 'unavailable'>"
 ```
+Reuse Phase 1's `get_table_lineage` result here too — don't re-fetch it. Pass `"unavailable"`
+(not an empty string) for any of the three lineage fields if that call errored or was never
+configured, so the page distinguishes "checked, found nothing" from "never checked" the same way
+Phase 3's ticket does.
 Capture the page URL for Phase 11's summary. If neither the Atlassian connector's Confluence
 tools nor `CONFLUENCE_BASE_URL`/`CONFLUENCE_EMAIL`/`CONFLUENCE_API_TOKEN` are configured, note
 that plainly in the final report — same treatment as a missing `SLACK_WEBHOOK_URL` in Phase 10,
@@ -735,10 +976,12 @@ not a silent skip and not a hard failure of the whole run.
 
 ## Phase 11 — Summary
 
-Clean up the isolated clone: `rm -rf <repo_dir>` in Bash mode. `opsbuddy-git-ops` exposes no
-delete tool by design (minimal write surface — see its README's safety model), so clones made via
-MCP accumulate under its workdir; note that plainly in the final report rather than silently
-leaving it unaddressed, and clean it up manually/periodically outside this skill. Then print:
+Clean up the isolated clone: call `git_cleanup(repo_dir)` (MCP mode) — it deletes `repo_dir`
+but only when it resolves under `opsbuddy-git-ops`'s own `OPSBUDDY_MCP_WORKDIR`, refusing anything
+outside it (same sandboxing as every other tool in this server, not a general delete capability).
+In Bash mode, `rm -rf <repo_dir>` is the equivalent fallback. Report whether cleanup succeeded
+(`deleted: true/false` plus `error`) in the final summary below rather than silently leaving it
+unaddressed. Then print:
 ```
 <✅ | ⚠️> <TICKET-KEY> — <EXECUTION_STATUS>
 ══════════════════════════════════════
@@ -755,6 +998,7 @@ leaving it unaddressed, and clean it up manually/periodically outside this skill
                  list any of the 5 that never fired and why, e.g. "3/4 skipped: halted at Gate 3.5")
   Databricks row: <incident_id/skipped>
   Confluence   : <page_url/skipped (reason)>
+  Cleanup      : <deleted/failed (error)>
 ══════════════════════════════════════
 ```
 If the run halted at Gate 3.5, Phase 5, Phase 8, or Gate 8.5, state clearly which phase it
