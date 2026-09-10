@@ -537,9 +537,15 @@ python ${CLAUDE_PLUGIN_ROOT}/workflow/databricks_workflow.py get-repo-mapping \
 ```
 Always pass `job_id` and, for the preferred path, `source_content`. `repo_url`/`error: null` →
 use that `repo_url`/`branch` for every step below. The response's `resolution_method`
-(`databricks_repos` / `job_git_source` / `heuristic_source_scan`) tells you which mechanism
-actually resolved it — if it's the heuristic one, note that explicitly in the ticket/report: it's
-a strong signal, not a guarantee.
+(`databricks_repos` / `job_git_source` / `dab_bundle_mapping` / `heuristic_source_scan`) tells you
+which mechanism actually resolved it — if it's `dab_bundle_mapping` or `heuristic_source_scan`,
+note that explicitly in the ticket/report: both are strong signals, not guarantees
+(`dab_bundle_mapping` depends on a manually-configured `OPSBUDDY_BUNDLE_REPO_MAP` entry existing
+for that bundle, not anything Databricks tracks natively — if the bundle isn't in that map yet,
+this plugin's own `opsbuddy-git-ops` server's error message names the exact bundle/target to add;
+the separate `databricks-job-lineage` MCP alternative and the Bash fallback below don't have this
+mechanism at all, only the official Repos/job_git_source pair, plus the Bash fallback's own
+heuristic).
 
 **If you're on the Bash fallback (no built-in heuristic) and it also errors — don't stop yet,
 try the same heuristic manually first.** `get_repo_mapping` only knows about Databricks' two
