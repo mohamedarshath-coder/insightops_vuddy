@@ -565,14 +565,17 @@ def _load_bundle_repo_map() -> dict:
     bundle: unlike Mechanisms 1/2, there is no Databricks API that can tell you which git repo a
     CI-deployed bundle came from. Returns {} (not an error) if unset or unparsable -- an empty
     map just means "no mapping configured for this bundle yet", handled the same as any other
-    not-yet-set optional config in this server, not a reason to crash the whole tool call."""
+    not-yet-set optional config in this server, not a reason to crash the whole tool call.
+    """
     raw = os.environ.get("OPSBUDDY_BUNDLE_REPO_MAP", "").strip()
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
-    except Exception:  # noqa: BLE001 - malformed config -- degrade to "no mapping", don't crash
+    except (
+        Exception
+    ):  # noqa: BLE001 - malformed config -- degrade to "no mapping", don't crash
         return {}
 
 
@@ -1085,7 +1088,7 @@ def get_repo_mapping(
                     f"(target {bundle_target!r}) -- Databricks Asset Bundles deployed via CI "
                     f"carry no git linkage of their own (no /Repos/ path, no job-level "
                     f"git_source), so this manually-configured mapping is the only way to "
-                    f"resolve the repo. `branch` is assumed to be \"main\" since bundle "
+                    f'resolve the repo. `branch` is assumed to be "main" since bundle '
                     f"deploys don't record a source branch either -- verify this matches the "
                     f"repo's actual default branch before opening a PR against it."
                 ),
