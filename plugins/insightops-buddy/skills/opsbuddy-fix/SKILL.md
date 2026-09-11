@@ -306,6 +306,20 @@ not a rename).
 
 ## Phase 3 — Ticket
 
+**Determine severity first** — computed once here, reused unchanged for both the Jira ticket
+(this phase) and the incident-log row (Phase 10), so it never drifts between the two:
+
+| Severity | When | Jira priority |
+|---|---|---|
+| `P1` | Production job (name doesn't look like a qa/test/dev variant) AND `CODE_FIX_POSSIBLE == false` (needs a human, can't self-heal) — OR `get_table_lineage`'s `downstream_consumers` is non-empty (breaks other things), if lineage was checked | Highest |
+| `P2` | Production job, `CODE_FIX_POSSIBLE == true`, no known downstream impact | High |
+| `P3` | Job name suggests non-production (contains `_qa`/`_test`/`-test`/`test_`), regardless of fixability | Medium |
+| `P4` | One-off/manual run with no real production consequence — rare; default to `P2` if genuinely unsure rather than guessing this low | Low |
+
+If lineage wasn't checked (Phase 1 marks it "unavailable"), just use `CODE_FIX_POSSIBLE` +
+production/non-production — don't block ticket creation waiting on a lineage call you don't
+already have.
+
 **Dedup first:**
 ```
 # MCP-preferred (Atlassian connector)
@@ -324,12 +338,15 @@ mcp__claude_ai_Atlassian__createJiraIssue(cloudId="<cloudId>", projectKey="<proj
   issueTypeName="<first available of Incident/Bug/Task/Story>",
   summary="[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>",
   description="<run metadata + full diagnostics -- standard Markdown, see format note below>",
-  additional_fields={"priority": {"name": "High"}, "labels": ["opsbuddy-fix"]})
+  additional_fields={"priority": {"name": "<Jira priority from the severity table above>"},
+    "labels": ["opsbuddy-fix", "severity-<p1|p2|p3|p4, lowercase>"]})
 
 # Bash fallback
 python ${CLAUDE_PLUGIN_ROOT}/workflow/jira_workflow.py create --project <project> --type Task \
   --summary "[opsbuddy-fix] <job_name> run $ARGUMENTS failed — <ERROR_CATEGORY>" \
-  --description "<run metadata + full diagnostics -- standard Markdown>" --priority High --label opsbuddy-fix
+  --description "<run metadata + full diagnostics -- standard Markdown>" \
+  --priority <Jira priority from the severity table above> \
+  --label opsbuddy-fix --label severity-<p1|p2|p3|p4, lowercase>
 ```
 **Description format — standard Markdown only, never Jira wiki markup.** The Atlassian
 connector's `description` renders CommonMark Markdown and converts it to ADF itself — it does
@@ -926,7 +943,7 @@ points at) via `DESCRIBE TABLE`; write exactly this shape:
   "pr_url": "<pr_url, or empty string if not reached>",
   "pr_review_verdict": "<Mode A verdict, or empty string if not reached>",
   "execution_status": "<EXECUTION_STATUS>",
-  "severity": "High",
+  "severity": "<the same P1/P2/P3/P4 value computed and used in Phase 3 -- never re-derive or hardcode this here, or it will drift from what the ticket actually shows>",
   "detected_at": "<ISO timestamp of Phase 1's telemetry fetch -- this column has no default, the insert fails outright without it>",
   "resolved_at": "<ISO timestamp of this Phase 10 write, or omit if not yet resolved>",
   "email_sent": <true|false -- this table has no Slack-specific column; reuse this one to mean "an alert was sent" regardless of channel, until/unless the table is renamed>,
