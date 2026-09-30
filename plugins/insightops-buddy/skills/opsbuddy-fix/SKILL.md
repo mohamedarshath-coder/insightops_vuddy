@@ -850,9 +850,18 @@ sends alert 4 first, verifies against the unmerged branch, and only reaches this
 afterward; a job matching the "must merge to verify" limitation reaches this gate first, so
 alert 3 fires before alert 4.
 
-Real success → Phase 9. Genuine failure (dbt/job actually re-ran the fix and it still broke) →
-loop back to Phase 5 once (same bounded budget as Phase 8's retry). One-time `jobs.submit()` run
-with no `job_id` → skip this gate and note why.
+**Set `EXECUTION_STATUS` here — this is the value Phase 9/10 reuse unchanged, and it's what the
+dashboard's "Verified Resolutions %" metric actually filters on, so don't leave it as a bare
+"RESOLVED":**
+
+| Outcome | `EXECUTION_STATUS` |
+|---|---|
+| Real re-run succeeded | `RESOLVED_VERIFIED` — proceed to Phase 9 |
+| Legitimately skipped (one-time `jobs.submit()` run with no `job_id`, or the "known limitation" re-run-can't-validate-a-pre-merge-branch case above) | `RESOLVED_VERIFICATION_SKIPPED` — proceed to Phase 9 |
+| Genuine failure (job actually re-ran the fix and it still broke) | `VERIFICATION_FAILED` — loop back to Phase 5 once (same bounded budget as Phase 8's retry) |
+
+Never write a plain `RESOLVED` — it's indistinguishable from a merge no one ever re-checked, which
+is exactly the gap that made this metric under-report every incident verified this session.
 
 ## Phase 9 — Ticket Update
 
