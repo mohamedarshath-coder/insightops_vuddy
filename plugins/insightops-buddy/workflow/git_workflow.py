@@ -62,8 +62,16 @@ class GitHubClient:
         return self.repo.get_pull(pr_number)
 
     def merge_pr(self, pr_number: int, merge_method: str = "squash") -> None:
+        """Confirmed in practice: GitHub computes `mergeable`/`mergeable_state` asynchronously
+        after a PR's checks finish, and can sit at `mergeable=None, mergeable_state="unknown"`
+        for well over two minutes even when the PR is actually mergeable right now -- a PR that
+        merged instantly via the real API call still showed "unknown" through repeated polling.
+        Pre-refusing on that would be a false negative, not a real safety check. Only treat
+        `mergeable is False` (a genuine, already-computed conflict) as a hard stop; for anything
+        else (True, or still-unknown None), just attempt the merge and let GitHub's own merge
+        endpoint be the authority -- it raises a real, specific error if it actually can't."""
         pr = self.get_pr(pr_number)
-        if not pr.mergeable:
+        if pr.mergeable is False:
             raise RuntimeError(
                 f"PR #{pr_number} is not mergeable (status: {pr.mergeable_state})"
             )

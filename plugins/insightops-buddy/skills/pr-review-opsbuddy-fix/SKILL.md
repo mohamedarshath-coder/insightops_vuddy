@@ -48,6 +48,19 @@ CI configured at all, there's nothing to gate on; note that plainly in the verdi
 treating silence as either a pass or a blocker. If checks *are* configured and any are red,
 diagnose and report what needs fixing before continuing.
 
+**If the repo has a `databricks.yml` (Databricks Asset Bundle) with a `test-qa` check** — treat
+this as the authoritative static-validation signal, not a local lint pass. `test-qa` deploys the
+fix and actually runs the real job/notebook against an isolated `qa`-schema copy of production
+data, which catches genuine data-correctness bugs (a wrong column reference, a broken join, a
+schema mismatch) that lint/syntax checks structurally cannot — confirmed in practice on SCRUM-107:
+a one-line typo fix passed `black`/`flake8`/`py_compile` trivially, but the only thing that
+actually proved the fix *worked* was `test-qa` running the corrected code against real qa data.
+A `test-qa` failure is an automatic Mode A `FAIL` on point 5 below, **regardless of what local
+lint/syntax says** — a fix that's syntactically perfect but produces the same real error against
+real data is not a passing fix. Conversely, don't let a `test-qa` pass alone stand in for points
+1-4 and 6-7 (scope/targeted/category-match/no-suppression/no-scope-creep/re-run-safety) — it
+proves the fix *runs*, not that it's the *right, minimal* fix.
+
 ---
 
 ## Step 3 — The 7-Point Mode A Checklist
@@ -63,8 +76,12 @@ Validates the diff against the confirmed root cause, not general style conventio
 4. **No error-suppression anti-patterns** — no bare `except:`, no silently dropping or
    nulling-out bad records, no swallowed exceptions, unless explicitly justified with a code
    comment explaining why that's safe here.
-5. **Static validation passed** — the `testing` sub-skill ran clean (lint, syntax, relevant unit
-   tests green); attach its captured output.
+5. **Static validation passed** — for repos without a `test-qa` check, this means the `testing`
+   sub-skill ran clean (lint, syntax, relevant unit tests green). For repos *with* a `test-qa`
+   check (see Step 2), that check's result is authoritative for this point — a `test-qa` PASS
+   satisfies it even if the repo has no unit tests at all (as `opsbuddy-failure-lab` doesn't);
+   a `test-qa` FAIL fails this point even if lint/syntax are clean. Either way, attach the
+   captured output/run URL.
 6. **No scope creep** — no unrelated refactors or pure formatting diffs beyond the minimal fix.
 7. **Re-run safety** — re-running the Databricks job after this fix must not double-process,
    duplicate rows, or corrupt data (idempotency check).

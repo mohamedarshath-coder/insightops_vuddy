@@ -100,10 +100,14 @@ shape, same SQL construction) so behavior stays identical to the Code-driven pat
 get_repo_mapping needs DATABRICKS_HOST/DATABRICKS_TOKEN (only that one tool -- everything else
 above works with zero Databricks config at all). It re-implements the same Databricks Repos /
 job-level Git source lookup the databricks-job-lineage plugin's own get_repo_mapping does, so this
-plugin doesn't depend on that other plugin being installed or exposing that tool, PLUS a third
-fallback neither of those has: scanning already-fetched task source for a hardcoded git URL, for
-jobs whose task code clones a repo manually in Python rather than using either of Databricks'
-official git-linkage mechanisms (confirmed in practice, twice, building this plugin).
+plugin doesn't depend on that other plugin being installed or exposing that tool, PLUS two
+fallbacks neither of those has: a job deployed via a Databricks Asset Bundle (`databricks bundle
+deploy`, e.g. from a CI run) has NO git linkage Databricks itself can report at all -- no /Repos/
+checkout, no job-level git_source -- resolved instead via OPSBUDDY_BUNDLE_REPO_MAP (a JSON env
+var mapping bundle name -> repo URL, configured by hand per bundle); and, failing that, scanning
+already-fetched task source for a hardcoded git URL, for jobs whose task code clones a repo
+manually in Python rather than using any official mechanism (confirmed in practice, twice,
+building this plugin).
 
 create_pr/find_open_pr talk to the GitHub API directly (via PyGithub), unlike every git_* tool
 above (which only ever runs local `git` CLI commands) -- mirrors workflow/git_workflow.py's
@@ -124,12 +128,16 @@ Run it:
     pip install -r requirements.txt
     export GITHUB_TOKEN=ghp_...        # optional, HTTPS clones/pushes of private repos only
     export OPSBUDDY_MCP_WORKDIR=D:\\opsbuddy\\opsbuddy-git-workdir   # optional, see default below
+    # Optional -- only needed if any job you point opsbuddy-fix at is deployed via a Databricks
+    # Asset Bundle (see get_repo_mapping's Mechanism 3):
+    export OPSBUDDY_BUNDLE_REPO_MAP='{"<bundle-name>": "https://github.com/<owner>/<repo>"}'
     python server.py
 
 Then point an MCP client (Claude Desktop, Claude Code, etc.) at it as a stdio server -- see
 README.md for the exact client config.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -520,7 +528,7 @@ _GIT_URL_PATTERN = re.compile(
 
 
 def _find_git_url_in_source(source_content: str) -> Optional[str]:
-    """Heuristic fallback (Mechanism 3) for jobs whose task code clones a repo manually in
+    """Heuristic fallback (Mechanism 4) for jobs whose task code clones a repo manually in
     Python/shell rather than using either of Databricks' official git-linkage mechanisms --
     confirmed in practice, twice, that this is a real, common pattern, not a hypothetical one.
     Returns the FIRST match with any embedded credential stripped, or None if nothing matches.
@@ -536,6 +544,39 @@ def _find_git_url_in_source(source_content: str) -> Optional[str]:
     # Strip an embedded https://TOKEN@host/... credential -- the caller authenticates via
     # GITHUB_TOKEN/GIT_ASKPASS instead, never via a token baked into the URL itself.
     return re.sub(r"://[^@\s\"'/]+@", "://", url)
+
+
+# Matches a Databricks Asset Bundle's synced workspace path shape for one deployed source file:
+# .../.bundle/<bundle_name>/<target>/files/<relative_path_in_repo>. A bundle deployed this way
+# (e.g. via `databricks bundle deploy` from a CI run) carries NO git linkage Databricks itself
+# can report: no /Repos/ checkout exists (Mechanism 1 needs one), and there is no job-level
+# git_source either (Mechanism 2 needs one) -- `databricks bundle deploy` uploads files, it does
+# not record where they came from. Ported from the Databricks App (Genie Code) fork of this
+# server, where this was confirmed as a real, live gap -- a bundle-deployed job's source_path had
+# no resolution path at all until this mechanism was added.
+_BUNDLE_PATH_PATTERN = re.compile(
+    r"\.bundle/(?P<bundle_name>[^/]+)/(?P<target>[^/]+)/files/(?P<relative_path>.+)$"
+)
+
+
+def _load_bundle_repo_map() -> dict:
+    """OPSBUDDY_BUNDLE_REPO_MAP -- a JSON object mapping bundle name -> repo URL, e.g.
+    '{"my-bundle": "https://github.com/owner/repo"}'. This has to be configured by hand, once per
+    bundle: unlike Mechanisms 1/2, there is no Databricks API that can tell you which git repo a
+    CI-deployed bundle came from. Returns {} (not an error) if unset or unparsable -- an empty
+    map just means "no mapping configured for this bundle yet", handled the same as any other
+    not-yet-set optional config in this server, not a reason to crash the whole tool call.
+    """
+    raw = os.environ.get("OPSBUDDY_BUNDLE_REPO_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (
+        Exception
+    ):  # noqa: BLE001 - malformed config -- degrade to "no mapping", don't crash
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +935,7 @@ def get_repo_mapping(
     source_path: str, job_id: str = "", source_content: str = ""
 ) -> dict:
     """
-    Resolve a Databricks task's source_path to the git repo it actually lives in, trying three
+    Resolve a Databricks task's source_path to the git repo it actually lives in, trying four
     mechanisms in order:
 
       1. Databricks Repos -- source_path is a workspace path under /Repos/...; the path itself
@@ -903,14 +944,23 @@ def get_repo_mapping(
          Job details -> Git). Here source_path is *relative to the repo root* (no leading "/"),
          and the repo URL/branch live on the job's settings.git_source instead -- pass job_id for
          this case to resolve at all.
-      3. Heuristic source scan -- if 1 and 2 both find nothing, and you pass the task's actual
-         source (source_content, e.g. from a fetch via another server's get_source_file), scans
-         it for a hardcoded git URL. This covers jobs whose task code clones a repo manually in
-         Python/shell rather than using either official mechanism -- confirmed in practice, twice,
+      3. Databricks Asset Bundle deployment -- source_path matches the synced workspace shape a
+         bundle deploy produces (".../.bundle/<bundle_name>/<target>/files/<relative_path>").
+         Unlike mechanisms 1/2, Databricks has NO record of which git repo a bundle-deployed job
+         came from (a `databricks bundle deploy` just uploads files) -- this is resolved instead
+         via OPSBUDDY_BUNDLE_REPO_MAP, a JSON env var mapping bundle name -> repo URL that has to
+         be configured by hand, once per bundle. If the bundle name isn't in that map, this
+         returns a clear, actionable error naming the bundle/target so you know exactly what to
+         add, rather than silently falling through to mechanism 4 (which has no chance of
+         resolving a bundle-deployed job -- these jobs don't clone anything themselves).
+      4. Heuristic source scan -- if 1-3 all find nothing, and you pass the task's actual source
+         (source_content, e.g. from a fetch via another server's get_source_file), scans it for a
+         hardcoded git URL. This covers jobs whose task code clones a repo manually in
+         Python/shell rather than using any official mechanism -- confirmed in practice, twice,
          building this plugin, that this is common, not a hypothetical. Any embedded credential
          in that URL is stripped before it's returned.
 
-    A source_path resolved by none of the three returns repo_url=None -- treat that as "there is
+    A source_path resolved by none of the four returns repo_url=None -- treat that as "there is
     no git repo to fix this in", not something to retry.
     """
     empty = {
@@ -970,8 +1020,8 @@ def get_repo_mapping(
                 "resolution_method": "databricks_repos",
                 "error": None,
             }
-        # Falls through to Mechanism 3 below rather than erroring immediately -- a /Repos/ path
-        # Databricks doesn't recognize is unusual but not proof there's no heuristic answer.
+        # Falls through to Mechanism 3/4 below rather than erroring immediately -- a /Repos/
+        # path Databricks doesn't recognize is unusual but not proof there's no other answer.
 
     # --- Mechanism 2: job-level Git source ---
     elif not source_path.startswith("/"):
@@ -1010,9 +1060,53 @@ def get_repo_mapping(
                 "resolution_method": "job_git_source",
                 "error": None,
             }
-        # No git_source configured -- falls through to Mechanism 3 below.
+        # No git_source configured -- falls through to Mechanism 3/4 below.
 
-    # --- Mechanism 3: heuristic scan of already-fetched task source ---
+    # --- Mechanism 3: Databricks Asset Bundle deployment ---
+    # Checked regardless of the branch above -- a bundle-synced path always starts with "/"
+    # (e.g. "/Workspace/Users/.../.bundle/<name>/<target>/files/...") so it would otherwise fall
+    # straight through Mechanism 2's elif (which only fires for a path with NO leading "/") with
+    # nothing catching it at all.
+    bundle_match = _BUNDLE_PATH_PATTERN.search(source_path)
+    if bundle_match:
+        bundle_name = bundle_match.group("bundle_name")
+        bundle_target = bundle_match.group("target")
+        relative_path = bundle_match.group("relative_path")
+        bundle_map = _load_bundle_repo_map()
+        mapped_repo_url = bundle_map.get(bundle_name)
+        if mapped_repo_url:
+            return {
+                "source_path": source_path,
+                "repo_url": mapped_repo_url,
+                "repo_path_in_workspace": None,
+                "relative_path_in_repo": relative_path,
+                "branch": "main",
+                "provider": None,
+                "resolution_method": "dab_bundle_mapping",
+                "error": (
+                    f"Resolved via OPSBUDDY_BUNDLE_REPO_MAP for bundle {bundle_name!r} "
+                    f"(target {bundle_target!r}) -- Databricks Asset Bundles deployed via CI "
+                    f"carry no git linkage of their own (no /Repos/ path, no job-level "
+                    f"git_source), so this manually-configured mapping is the only way to "
+                    f'resolve the repo. `branch` is assumed to be "main" since bundle '
+                    f"deploys don't record a source branch either -- verify this matches the "
+                    f"repo's actual default branch before opening a PR against it."
+                ),
+            }
+        return {
+            **empty,
+            "error": (
+                f"source_path is under a Databricks Asset Bundle deployment (bundle="
+                f"{bundle_name!r}, target={bundle_target!r}), which has no git linkage "
+                f"Databricks itself can report (no /Repos/ path, no job-level git_source -- "
+                f"confirmed, this is the real shape of a CI-deployed bundle job, not a "
+                f"hypothetical). Add {bundle_name!r} to OPSBUDDY_BUNDLE_REPO_MAP (a JSON object "
+                f"mapping bundle name -> repo URL) to resolve this bundle going forward. "
+                f"relative_path_in_repo would have been {relative_path!r}."
+            ),
+        }
+
+    # --- Mechanism 4: heuristic scan of already-fetched task source ---
     if source_content:
         found_url = _find_git_url_in_source(source_content)
         if found_url:
@@ -1035,8 +1129,8 @@ def get_repo_mapping(
         **empty,
         "error": (
             "No git repo found for this source_path via Databricks Repos, job-level Git source, "
-            "or (if source_content was passed) a hardcoded URL in the task's own code. This task "
-            "may not be linked to any git repo at all."
+            "a Databricks Asset Bundle mapping, or (if source_content was passed) a hardcoded "
+            "URL in the task's own code. This task may not be linked to any git repo at all."
         ),
     }
 
