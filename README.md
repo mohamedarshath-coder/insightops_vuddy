@@ -1,4 +1,4 @@
-# insightops_vuddy
+# insightops_buddy
 
 A Claude Code plugin marketplace hosting one plugin: **insightops-buddy** — autonomous end-to-end
 incident response for failed Databricks production job runs (diagnose, ticket, fix, PR, review,
